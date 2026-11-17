@@ -1,0 +1,13 @@
+[Unit]
+Description=spotcast - Spotify Connect to Yamaha RX-V671 over UPnP
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/spotcast/spotcast.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
