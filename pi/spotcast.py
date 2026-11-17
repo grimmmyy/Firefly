@@ -9,7 +9,7 @@ Pipeline:
 librespot --onevent posts player events to /event; on "playing" we make sure
 the receiver is powered on and playing our stream.
 """
-import os, sys, time, struct, threading, subprocess, socket, html, logging
+import os, sys, re, time, struct, threading, subprocess, socket, html, logging
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -75,9 +75,32 @@ class Hub:
             return len(self.clients)
 
 
+# Receiver buffer tuning. The RX-V671 settles at a random 0.25-0.8 s buffer per
+# connection, with a ~0.3 s floor it refills to. Withholding silent audio for d
+# seconds shrinks its buffer by d, so we trim each connection down to TARGET.
+BUF_TARGET = float(os.environ.get("SPOTCAST_BUFFER_TARGET", "0.30"))
+tune = {"t0": None, "drained": 0.0, "drain_left": 0.0, "last": None}
+
 hub = Hub()        # mp3
 pcm_hub = Hub()    # raw big-endian PCM (L16)
 wav_hub = Hub()    # little-endian PCM (WAV body)
+
+
+# Audio allowed to queue inside the Pi before the pump catches up (x CHUNK_MS).
+PI_JITTER_CHUNKS = int(os.environ.get("SPOTCAST_JITTER_CHUNKS", "3"))
+pi_buf_samples = []
+
+
+def pi_buffer_ms():
+    xs = pi_buf_samples[-500:]
+    del pi_buf_samples[:-500]
+    return round(sum(xs) / len(xs) / (44100 * 4) * 1000) if xs else 0
+
+
+def is_silent(pcm, threshold=48):
+    """True if every s16le sample in this chunk is near zero."""
+    a = memoryview(pcm).cast("h")
+    return max(a) < threshold and -min(a) < threshold
 
 
 def start_pipeline():
@@ -127,7 +150,8 @@ def start_pipeline():
                     out = bytes(buf[:CHUNK]); del buf[:CHUNK]
                     # if librespot got far ahead (it decodes faster than real time
                     # only briefly), drain faster to avoid growing latency
-                    extra = len(buf) > CHUNK * 20
+                    extra = len(buf) > CHUNK * PI_JITTER_CHUNKS
+                    pi_buf_samples.append(len(buf))
                 else:
                     out = SILENCE; extra = False
             if pcm_hub.count():
@@ -135,7 +159,12 @@ def start_pipeline():
                 be[0::2], be[1::2] = out[1::2], out[0::2]   # s16le -> s16be (L16)
                 pcm_hub.publish(bytes(be))
             if wav_hub.count():
-                wav_hub.publish(out)
+                if tune["drain_left"] > 0 and is_silent(out):
+                    step = CHUNK_MS / 1000            # withhold silence: buffer shrinks
+                    tune["drain_left"] = max(0.0, tune["drain_left"] - step)
+                    tune["drained"] += step
+                else:
+                    wav_hub.publish(out)
             if hub.count():
                 try:
                     ff.stdin.write(out)
@@ -563,6 +592,59 @@ def receiver_status():
         return None, None
 
 
+def position_seconds():
+    r = soap("AVTransport", "GetPositionInfo", [("InstanceID", 0)])
+    m = re.search(r"<RelTime>(\d+):(\d+):(\d+)", r)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) if m else None
+
+
+def measure_buffer(seconds=7):
+    """Receiver buffer = audio sent since connect - receiver's played position,
+    sampled exactly at each RelTime tick (RelTime has 1 s resolution)."""
+    t0 = tune["t0"]
+    if t0 is None:
+        return None
+    ests, last = [], position_seconds()
+    end = time.time() + seconds
+    while time.time() < end:
+        if tune["t0"] != t0:
+            return None                    # reconnected mid-measure
+        rt = position_seconds()
+        if rt is not None and last is not None and rt > last:
+            ests.append((time.time() - t0 - tune["drained"]) - rt)
+        last = rt
+        time.sleep(0.03)
+    ests = ests[1:] or ests
+    return sorted(ests)[len(ests) // 2] if ests else None
+
+
+def buffer_tuner():
+    last_t0, next_check = None, 0
+    while True:
+        time.sleep(2)
+        try:
+            if tune["t0"] is None or wav_hub.count() == 0:
+                continue
+            if tune["t0"] != last_t0:              # new connection: let it settle
+                last_t0, next_check = tune["t0"], time.time() + 3
+            if time.time() < next_check or tune["drain_left"] > 0:
+                continue
+            b = measure_buffer()
+            if b is None:
+                continue
+            tune["last"] = round(b, 2)
+            if b > BUF_TARGET + 0.06:
+                tune["drain_left"] = b - BUF_TARGET
+                log.info("receiver buffer %.2fs -> trimming %.2fs of silence", b,
+                         tune["drain_left"])
+                next_check = time.time() + 20
+            else:
+                next_check = time.time() + 300
+        except Exception as e:
+            log.info("tuner error: %s", e)
+            time.sleep(10)
+
+
 def watchdog():
     """While Spotify is playing on any slot, keep the receiver on our stream.
     Leaves it alone if someone deliberately switched to another input."""
@@ -571,6 +653,7 @@ def watchdog():
         try:
             if not any(x.playing for x in slots.slots):
                 continue
+            refresh_stream_url()
             state, uri = transport_state()
             if state == "PLAYING" and uri == STREAM_URL:
                 continue
@@ -598,7 +681,20 @@ def transport_state():
 ensure_lock = threading.Lock()
 
 
+def refresh_stream_url():
+    """Re-derive our LAN address (it changes if the Pi moves Wi-Fi <-> Ethernet)."""
+    global STREAM_URL
+    try:
+        url = f"http://{lan_ip()}:{PORT}/stream.{FORMAT}"
+        if url != STREAM_URL:
+            log.info("stream URL changed: %s -> %s", STREAM_URL, url)
+            STREAM_URL = url
+    except OSError:
+        pass
+
+
 def ensure_playing():
+    refresh_stream_url()
     with ensure_lock:
         state, uri = transport_state()
         if state == "PLAYING" and uri == STREAM_URL:
@@ -690,6 +786,7 @@ class Handler(BaseHTTPRequestHandler):
             src = hub if p.path == "/stream.mp3" else pcm_hub
             if p.path == "/stream.wav":
                 src = wav_hub
+                tune.update(t0=time.time(), drained=0.0, drain_left=0.0)
             c = src.add()
             q, ev = c
             log.info("client connected %s (%d total)", self.client_address[0], hub.count())
@@ -760,7 +857,9 @@ code{{color:#ddd}}</style>
             self.wfile.write(body)
         elif p.path == "/status":
             body = (f"clients mp3={hub.count()} l16={pcm_hub.count()} "
-                    f"wav={wav_hub.count()} url={STREAM_URL}\n").encode()
+                    f"wav={wav_hub.count()} url={STREAM_URL} "
+                    f"pi_queue={pi_buffer_ms()}ms buffer={tune['last']}s drained={tune['drained']:.2f}s "
+                    f"pending={tune['drain_left']:.2f}s\n").encode()
             self.send_response(200); self.send_header("Content-Type", "text/plain")
             self.end_headers(); self.wfile.write(body)
         else:
@@ -779,6 +878,7 @@ def main():
     os.makedirs("/var/lib/spotcast", exist_ok=True)
     start_pipeline()
     threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=buffer_tuner, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
