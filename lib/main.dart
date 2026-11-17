@@ -1,27 +1,27 @@
 import 'package:flutter/material.dart';
-import 'ui/home_page.dart';
+
 import 'services/cast_controller.dart';
+import 'services/spotcast.dart';
+import 'theme.dart';
+import 'ui/shell.dart';
 
 void main() {
-  runApp(const FireflyApp());
+  runApp(FireflyApp(app: AppState(CastController(), SpotcastController())));
 }
 
 class FireflyApp extends StatelessWidget {
-  const FireflyApp({super.key});
+  final AppState app;
+  const FireflyApp({super.key, required this.app});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Firefly',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFFFA726),
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-      ),
-      home: HomePage(controller: CastController()),
+      theme: FireflyTheme.dark(),
+      darkTheme: FireflyTheme.dark(),
+      themeMode: ThemeMode.dark,
+      home: Shell(app: app),
     );
   }
 }

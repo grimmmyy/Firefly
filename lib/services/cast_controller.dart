@@ -26,6 +26,74 @@ class CastController extends ChangeNotifier {
 
   List<SavedStation> stations = [];
 
+  // ------------------------------------------------------------ recents + queue
+  List<String> recents = [];
+  List<File> queue = [];
+  int queueIndex = 0;
+  Timer? _advance;
+  bool _sawPlaying = false;
+
+  Future<void> loadRecents() async {
+    final prefs = await SharedPreferences.getInstance();
+    recents = prefs.getStringList('recents') ?? [];
+    notifyListeners();
+  }
+
+  Future<void> _addRecent(String path) async {
+    recents = [path, ...recents.where((p) => p != path)].take(25).toList();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('recents', recents);
+  }
+
+  Future<void> clearRecents() async {
+    recents = [];
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('recents');
+    notifyListeners();
+  }
+
+  /// Play files in order, advancing when the receiver finishes each one.
+  Future<void> playQueue(List<File> files) async {
+    queue = files;
+    await playQueueIndex(0);
+  }
+
+  Future<void> playQueueIndex(int i) async {
+    if (i < 0 || i >= queue.length) return;
+    queueIndex = i;
+    _sawPlaying = false;
+    await playLocalFile(queue[i]);
+    _advance?.cancel();
+    _advance = Timer.periodic(const Duration(seconds: 2), (_) => _checkAdvance());
+  }
+
+  Future<void> _checkAdvance() async {
+    final client = _client;
+    if (client == null || queue.isEmpty) return;
+    try {
+      final st = (await client.getTransportInfo())['state'];
+      if (st == 'PLAYING') _sawPlaying = true;
+      if (_sawPlaying && st == 'STOPPED' && state == PlayState.playing) {
+        if (queueIndex + 1 < queue.length) {
+          await playQueueIndex(queueIndex + 1);
+        } else {
+          _advance?.cancel();
+          state = PlayState.stopped;
+          notifyListeners();
+        }
+      }
+    } catch (_) {}
+  }
+
+  void clearQueue() {
+    _advance?.cancel();
+    queue = [];
+    queueIndex = 0;
+    notifyListeners();
+  }
+
+  String basename(String path) => _basename(path);
+
   Future<void> loadStations() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList('stations') ?? _defaultStations;
@@ -114,6 +182,7 @@ class CastController extends ChangeNotifier {
     final client = _client;
     if (client == null) throw StateError('No renderer selected');
     final url = await _server.publish(file);
+    unawaited(_addRecent(file.path));
     await client.setAvTransportUri(url, title: title ?? _basename(file.path));
     await client.play();
     state = PlayState.playing;
@@ -144,6 +213,7 @@ class CastController extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _advance?.cancel();
     await _client?.stop();
     state = PlayState.stopped;
     notifyListeners();
@@ -157,6 +227,7 @@ class CastController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _advance?.cancel();
     _server.stop();
     super.dispose();
   }
