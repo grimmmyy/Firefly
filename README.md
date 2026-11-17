@@ -113,9 +113,12 @@ Download from the [latest release](../../releases/latest):
 
 | Platform | File | Install |
 |---|---|---|
-| Android | `Firefly-vX-android.apk` | Open it, allow "install unknown apps" |
-| iOS | `Firefly-vX-ios-unsigned.ipa` | Sideload with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) (free Apple ID: re-sign every 7 days) |
-| Windows | `Firefly-vX-windows-x64.zip` | Unzip anywhere, run `firefly.exe` (keep the folder together) |
+| Windows | `Firefly-vX-windows-setup.exe` | Run the installer (Start menu shortcut and uninstaller included). A portable `…-windows-portable.zip` is also attached. |
+| Android | `Firefly-vX-android.apk` | Open it and allow "install unknown apps" |
+| iOS | `Firefly-vX-ios.ipa` | Sideload with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) (free Apple ID: re-sign every 7 days) |
+
+Every release ships all three, and CI refuses to publish a release unless the EXE, IPA and APK all built.
+Each release also includes the Raspberry Pi bridge (`spotcast-pi-bridge-vX.tar.gz`) and `SHA256SUMS.txt`.
 
 On first launch, allow **Local Network** access (iOS) and the Windows Firewall prompt (**Private** networks),
 because the receiver pulls audio from the app.
@@ -153,7 +156,8 @@ flutter build windows --release
 ```
 
 CI builds every push. Pushing a `v*` tag builds all platforms and publishes a GitHub Release with the
-APK, unsigned IPA, Windows zip, Pi bridge tarball and checksums.
+Windows installer (`.exe`), iOS `.ipa`, Android `.apk`, a portable Windows zip, the Pi bridge tarball
+and checksums. If any platform fails, no release is published.
 
 ## Limitations
 

@@ -120,15 +120,26 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath Firefly-windows.zip
 
+      - name: Build installer (Firefly-Setup.exe)
+        shell: pwsh
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { choco install innosetup -y --no-progress | Out-Null; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc /Qp "/DAppVersion=$env:VERSION_NUM" "/DSourceDir=$PWDuild\windowsdunner\Release" windows-installer.iss
+          if (-not (Test-Path dist\Firefly-Setup.exe)) { throw "installer not produced" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: firefly-windows
-          path: Firefly-windows.zip
+          path: |
+            Firefly-windows.zip
+            dist/Firefly-Setup.exe
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    # Only publish when EVERY platform built: a release always has EXE + IPA + APK.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [android, ios, windows]
     runs-on: ubuntu-latest
     steps:
@@ -136,29 +147,28 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-        continue-on-error: true
-      - name: Collect assets
+      - name: Collect assets (fail if any platform is missing)
         run: |
           V="${GITHUB_REF_NAME}"
           mkdir -p out
-          [ -f dist/firefly-android-apk/app-release.apk ] && cp dist/firefly-android-apk/app-release.apk "out/Firefly-${V}-android.apk"
-          [ -f dist/firefly-ios-unsigned-ipa/Firefly-unsigned.ipa ] && cp dist/firefly-ios-unsigned-ipa/Firefly-unsigned.ipa "out/Firefly-${V}-ios-unsigned.ipa"
-          [ -f dist/firefly-windows/Firefly-windows.zip ] && cp dist/firefly-windows/Firefly-windows.zip "out/Firefly-${V}-windows-x64.zip"
+          need() { [ -f "$1" ] || { echo "::error::missing $1"; exit 1; }; cp "$1" "out/$2"; }
+          need dist/firefly-windows/dist/Firefly-Setup.exe        "Firefly-${V}-windows-setup.exe"
+          need dist/firefly-windows/Firefly-windows.zip           "Firefly-${V}-windows-portable.zip"
+          need dist/firefly-ios-unsigned-ipa/Firefly-unsigned.ipa "Firefly-${V}-ios.ipa"
+          need dist/firefly-android-apk/app-release.apk           "Firefly-${V}-android.apk"
           tar -czf "out/spotcast-pi-bridge-${V}.tar.gz" pi
           (cd out && sha256sum * > SHA256SUMS.txt)
           ls -la out
-      - name: Create or update release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           V="${GITHUB_REF_NAME}"
           NOTES=".github/release-notes/${V}.md"
+          [ -f "$NOTES" ] || { gh api repos/${{ github.repository }}/releases/generate-notes -f tag_name="$V" -q .body > /tmp/notes.md; NOTES=/tmp/notes.md; }
           if gh release view "$V" >/dev/null 2>&1; then
             gh release upload "$V" out/* --clobber
+            gh release edit "$V" --title "Firefly ${V}" --notes-file "$NOTES" --draft=false --latest
           else
-            if [ -f "$NOTES" ]; then
-              gh release create "$V" out/* --title "Firefly ${V}" --notes-file "$NOTES"
-            else
-              gh release create "$V" out/* --title "Firefly ${V}" --generate-notes
-            fi
+            gh release create "$V" out/* --title "Firefly ${V}" --notes-file "$NOTES" --latest
           fi
