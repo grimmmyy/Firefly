@@ -68,3 +68,32 @@ jobs:
           name: firefly-ios-unsigned-ipa
           path: build/ios/ipa/Firefly-unsigned.ipa
           if-no-files-found: error
+
+  windows:
+    name: Windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.24.5"
+
+      - name: Fill in missing Flutter scaffolding
+        run: flutter create . --platforms=windows --org com.firefly --project-name firefly
+
+      - run: flutter pub get
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Package zip
+        shell: pwsh
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath Firefly-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firefly-windows
+          path: Firefly-windows.zip
+          if-no-files-found: error

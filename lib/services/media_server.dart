@@ -103,16 +103,39 @@ class MediaServer {
       final wifiIp = await info.getWifiIP();
       if (wifiIp != null && wifiIp.isNotEmpty) return wifiIp;
     } catch (_) {}
+    // Desktop PCs are often on Ethernet with VPN/virtual adapters too, so
+    // rank private home-LAN ranges first and skip CGNAT/Tailscale (100.64/10).
+    int rank(String ip) {
+      if (ip.startsWith('192.168.')) return 0;
+      if (ip.startsWith('10.')) return 1;
+      final p = ip.split('.');
+      final second = p.length > 1 ? int.tryParse(p[1]) ?? 0 : 0;
+      if (p[0] == '172' && second >= 16 && second <= 31) return 2;
+      if (p[0] == '100' && second >= 64 && second <= 127) return 9;
+      return 5;
+    }
+
+    String? best;
     for (final iface in await NetworkInterface.list(
       type: InternetAddressType.IPv4,
       includeLoopback: false,
       includeLinkLocal: false,
     )) {
+      final name = iface.name.toLowerCase();
+      if (name.contains('vethernet') ||
+          name.contains('virtual') ||
+          name.contains('vmware') ||
+          name.contains('tailscale')) {
+        continue;
+      }
       for (final addr in iface.addresses) {
-        if (!addr.isLoopback) return addr.address;
+        if (addr.isLoopback) continue;
+        if (best == null || rank(addr.address) < rank(best)) {
+          best = addr.address;
+        }
       }
     }
-    return '127.0.0.1';
+    return best ?? '127.0.0.1';
   }
 
   String _guessMime(String path) {
