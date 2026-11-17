@@ -152,74 +152,75 @@ MAX_SLOTS = int(os.environ.get("SPOTCAST_MAX_SLOTS", "6"))
 SLOT_ROOT = "/var/lib/spotcast-user/slots"
 
 
-# ---------------- hide "Add me" from already-registered devices ----------------
-# Spotify can't filter a LAN-discovered device per account, so filter per
-# device: the Spotify app lists a zeroconf device only after it can reach its
-# HTTP endpoint. We remember the MAC of each phone/PC that claimed the spare
-# and REJECT it at the spare's zeroconf port, so it never shows "Add me".
+# ---------------- show "Add me" only when an unregistered device needs it -----------
+# A LAN-discovered Connect device can't be hidden per phone (its mDNS announce is
+# multicast and Spotify lists it without contacting it). Instead we watch who is
+# *looking*: every open Spotify app sends mDNS queries for _spotify-connect._tcp.
+# If one comes from a device that isn't registered (or ignored), the spare runs
+# for ADD_WINDOW seconds; otherwise no "Add me" exists at all.
 REG_FILE = "/var/lib/spotcast-user/registered.json"
-CHAIN = "SPOTCAST_HIDE"
+import struct
 
 
-class DeviceFilter:
+class DeviceWatch:
     def __init__(self):
-        self.lock = threading.Lock()
-        self.seen = {}          # ip -> last time it talked to the spare
+        self.pollers = {}       # ip -> last time it hit the spare's zeroconf port
+        self.unknown = {}       # mac -> {"ip", "at"} unregistered Spotify apps seen
         self.spare_port = None
-        self.show_all_until = 0.0
         try:
-            self.reg = json.load(open(REG_FILE))
+            d = json.load(open(REG_FILE))
         except Exception:
-            self.reg = {}       # mac -> {"account": id, "ip": last ip, "at": ts}
+            d = {}
+        self.reg = d.get("registered", {})
+        self.ignored = d.get("ignored", {})
 
     def save(self):
         with open(REG_FILE, "w") as f:
-            json.dump(self.reg, f, indent=1)
+            json.dump({"registered": self.reg, "ignored": self.ignored}, f, indent=1)
 
-    def ipt(self, *args):
-        return subprocess.run(["iptables", *args], capture_output=True, text=True)
+    @staticmethod
+    def mac_of(ip):
+        out = subprocess.run(["ip", "neigh", "show", ip], capture_output=True,
+                             text=True).stdout.split()
+        return out[out.index("lladdr") + 1].lower() if "lladdr" in out else None
 
-    def apply(self):
-        with self.lock:
-            if self.ipt("-L", CHAIN, "-n").returncode != 0:
-                self.ipt("-N", CHAIN)
-            if self.ipt("-C", "INPUT", "-j", CHAIN).returncode != 0:
-                self.ipt("-I", "INPUT", "-j", CHAIN)
-            self.ipt("-F", CHAIN)
-            if not self.spare_port or time.time() < self.show_all_until:
-                return
-            for mac in self.reg:
-                self.ipt("-A", CHAIN, "-p", "tcp", "--dport", str(self.spare_port),
-                         "-m", "mac", "--mac-source", mac,
-                         "-j", "REJECT", "--reject-with", "tcp-reset")
-
-    def show_all(self, secs=600):
-        self.show_all_until = time.time() + secs
-        log.info("'Add me' visible to all devices for %ds", secs)
-        self.apply()
-        def later():
-            time.sleep(secs + 1)
-            self.apply()
-        threading.Thread(target=later, daemon=True).start()
-
-    def show_all_left(self):
-        return max(0, int(self.show_all_until - time.time()))
+    def sniff(self):
+        # raw UDP socket (CAP_NET_RAW) sees mDNS queries without binding :5353
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+        my_ip = lan_ip()
+        while True:
+            pkt, (src, _) = sock.recvfrom(9000)
+            ihl = (pkt[0] & 0x0F) * 4
+            if len(pkt) < ihl + 8 or src == my_ip:
+                continue
+            dport = struct.unpack("!H", pkt[ihl + 2:ihl + 4])[0]
+            if dport != 5353:
+                continue
+            dns = pkt[ihl + 8:]
+            if len(dns) < 12 or dns[2] & 0x80:      # skip responses
+                continue
+            if b"_spotify-connect" not in dns:
+                continue
+            mac = self.mac_of(src)
+            if not mac or mac in self.reg or mac in self.ignored:
+                continue
+            first = mac not in self.unknown
+            self.unknown[mac] = {"ip": src, "at": int(time.time())}
+            if first:
+                log.info("unregistered Spotify device %s (%s) nearby; showing 'Add me'",
+                         mac, src)
+            slots.open_add_window(quiet=not first)
 
     def set_spare(self, pid):
-        # find the spare's zeroconf TCP port (everything it listens on but its ws port)
         for _ in range(20):
             out = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True).stdout
             for line in out.splitlines():
                 if f"pid={pid}," in line and "127.0.0.1:" not in line:
                     self.spare_port = int(line.split()[3].rsplit(":", 1)[1])
-                    log.info("spare zeroconf port %d; hiding it from %d registered device(s)",
-                             self.spare_port, len(self.reg))
-                    self.apply()
                     return
             time.sleep(1)
 
-    def watch(self):
-        # remember which LAN hosts talk to the spare, to attribute a claim
+    def watch_pollers(self):
         while True:
             if self.spare_port:
                 out = subprocess.run(["ss", "-tnH", "state", "all",
@@ -229,30 +230,39 @@ class DeviceFilter:
                     peer = line.split()[-1].rsplit(":", 1)[0].strip("[]")
                     if peer.startswith("::ffff:"):
                         peer = peer[7:]
-                    self.seen[peer] = time.time()
-            time.sleep(0.5)
+                    self.pollers[peer] = time.time()
+            time.sleep(0.3)
 
     def register_claim(self, account):
+        # the claimer is the device that talked to the spare most recently
         now = time.time()
-        ips = [ip for ip, t in self.seen.items() if now - t < 90]
-        for ip in ips:
-            out = subprocess.run(["ip", "neigh", "show", ip], capture_output=True,
-                                 text=True).stdout.split()
-            if "lladdr" in out:
-                mac = out[out.index("lladdr") + 1].lower()
-                self.reg[mac] = {"account": account, "ip": ip, "at": int(now)}
-                log.info("registered device %s (%s) for account %s", mac, ip,
-                         account[:6] + "...")
-        self.seen.clear()
+        recent = sorted(((t, ip) for ip, t in self.pollers.items() if now - t < 15),
+                        reverse=True)
+        self.pollers.clear()
+        if not recent:
+            log.info("claim by %s: couldn't tell which device", account[:6] + "...")
+            return
+        ip = recent[0][1]
+        mac = self.mac_of(ip)
+        if not mac:
+            return
+        self.reg[mac] = {"account": account, "ip": ip, "at": int(now)}
+        self.unknown.pop(mac, None)
+        self.save()
+        log.info("registered device %s (%s) for account %s", mac, ip, account[:6] + "...")
+
+    def ignore(self, mac):
+        info = self.unknown.pop(mac, {})
+        self.ignored[mac] = {"ip": info.get("ip", ""), "at": int(time.time())}
         self.save()
 
-    def forget_account(self, account):
-        for mac in [m for m, v in self.reg.items() if v.get("account") == account]:
-            del self.reg[mac]
+    def forget(self, mac):
+        self.reg.pop(mac, None)
+        self.ignored.pop(mac, None)
         self.save()
 
 
-devices = DeviceFilter()
+devices = DeviceWatch()
 
 
 class Slot:
@@ -377,7 +387,7 @@ class Slot:
 ADD_WINDOW = int(os.environ.get("SPOTCAST_ADD_WINDOW", "600"))
 # Default: always keep one unclaimed "Add me" device visible.
 # Set SPOTCAST_PERMANENT_SPARE=0 to only show it after tapping "Add a new person".
-PERMANENT_SPARE = os.environ.get("SPOTCAST_PERMANENT_SPARE", "1") != "0"
+PERMANENT_SPARE = os.environ.get("SPOTCAST_PERMANENT_SPARE", "0") == "1"
 
 
 class SlotManager:
@@ -386,9 +396,10 @@ class SlotManager:
         self.lock = threading.Lock()
         self.add_until = 0.0
 
-    def open_add_window(self):
+    def open_add_window(self, quiet=False):
         self.add_until = time.time() + ADD_WINDOW
-        log.info("add window open for %ds", ADD_WINDOW)
+        if not quiet:
+            log.info("add window open for %ds", ADD_WINDOW)
         self.ensure_spare()
 
     def add_window_left(self):
@@ -436,8 +447,8 @@ class SlotManager:
             self.add_until = time.time() + ADD_WINDOW
         self.ensure_spare()
         threading.Thread(target=self.reap, daemon=True).start()
-        threading.Thread(target=devices.watch, daemon=True).start()
-        devices.apply()
+        threading.Thread(target=devices.watch_pollers, daemon=True).start()
+        threading.Thread(target=devices.sniff, daemon=True).start()
 
     def _spawn(self, n):
         sl = Slot(self, n)
@@ -631,45 +642,52 @@ class Handler(BaseHTTPRequestHandler):
             elif e == "volume_changed" and qs.get("v"):
                 threading.Thread(target=set_volume, args=(qs["v"][0],), daemon=True).start()
             self.send_response(204); self.end_headers()
-        elif p.path in ("/", "/add", "/showall"):
-            if p.path == "/showall":
-                devices.show_all()
-                self.send_response(303); self.send_header("Location", "/"); self.end_headers()
-                return
+        elif p.path in ("/", "/add", "/ignore", "/forget"):
+            qs = urllib.parse.parse_qs(p.query)
             if p.path == "/add":
                 slots.open_add_window()
+            elif p.path == "/ignore" and qs.get("mac"):
+                devices.ignore(qs["mac"][0])
+            elif p.path == "/forget" and qs.get("mac"):
+                devices.forget(qs["mac"][0])
+            if p.path != "/":
                 self.send_response(303); self.send_header("Location", "/"); self.end_headers()
                 return
             left = slots.add_window_left()
             people = sum(1 for x in slots.slots if x.paired)
             playing = any(x.playing for x in slots.slots)
-            sl_left = devices.show_all_left()
-            msg = (("<p class=on>New people: pick 'Living Room - Add me' in Spotify once.</p>"
-                    f"<p>{len(devices.reg)} registered device(s) don't see 'Add me'.</p>"
-                    + (f"<p class=on>Showing 'Add me' to every device for "
-                       f"{sl_left // 60}:{sl_left % 60:02d}.</p>" if sl_left else
-                       "<form action=/showall><button>Show 'Add me' on my device too (10 min)"
-                       "</button></form><p>Use this to link a different Spotify account "
-                       "from a phone or PC that's already registered.</p>"))
-                   if PERMANENT_SPARE else
-                   f"<p class=on>'Living Room - Add me' is visible in Spotify for "
-                   f"{left // 60}:{left % 60:02d} more. The new person should pick it now.</p>"
-                   if left else
-                   "<form action=/add><button>Add a new person</button></form>"
-                   "<p>Shows 'Living Room - Add me' in Spotify for 10 minutes. "
-                   "They pick it once and it's theirs from then on.</p>")
+
+            def rows(d, action, label):
+                return "".join(
+                    f"<li><code>{m}</code> {v.get('ip', '')} "
+                    f"<a href='/{action}?mac={m}'>{label}</a></li>"
+                    for m, v in d.items()) or "<li>none</li>"
+            state = (f"<p class=on>'Add me' is visible for {left // 60}:{left % 60:02d}.</p>"
+                     if left else
+                     "<p>'Add me' is hidden (no unregistered devices nearby).</p>")
+            plural = "s" if people != 1 else ""
+            now_txt = "playing now" if playing else "idle"
             body = f"""<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Living Room Speaker</title>{'<meta http-equiv=refresh content=5>' if left and not PERMANENT_SPARE else ''}
+<title>Living Room Speaker</title>
 <style>body{{font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;
-padding:24px 16px;max-width:480px;margin:auto}}button{{width:100%;padding:16px;font-size:17px;
+padding:24px 16px;max-width:520px;margin:auto}}button{{width:100%;padding:16px;font-size:17px;
 font-weight:600;border:0;border-radius:12px;background:#1db954;color:#000}}
-p{{color:#aaa;line-height:1.45}}.on{{color:#1db954}}</style>
+p,li{{color:#aaa;line-height:1.5}}.on{{color:#1db954}}a{{color:#1db954}}
+code{{color:#ddd}}</style>
 <h1>Living Room Speaker</h1>
-<p>{people} Spotify account{'s' if people != 1 else ''} linked &middot;
-{'playing now' if playing else 'idle'}</p>{msg}""".encode()
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers(); self.wfile.write(body)
+<p>{people} Spotify account{plural} linked &middot; {now_txt}</p>{state}
+<form action=/add><button>Show 'Add me' for 10 minutes</button></form>
+<p>For linking another account from a device that's already registered.</p>
+<h3>Unregistered Spotify devices nearby</h3>
+<p>These make 'Add me' appear. Ignore TVs and speakers that aren't people.</p>
+<ul>{rows(devices.unknown, 'ignore', 'ignore')}</ul>
+<h3>Registered devices</h3><ul>{rows(devices.reg, 'forget', 'forget')}</ul>
+<h3>Ignored</h3><ul>{rows(devices.ignored, 'forget', 'un-ignore')}</ul>""".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
         elif p.path == "/status":
             body = f"clients={hub.count()} url={STREAM_URL}\n".encode()
             self.send_response(200); self.send_header("Content-Type", "text/plain")
