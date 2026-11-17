@@ -125,7 +125,7 @@ jobs:
         run: |
           $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { choco install innosetup -y --no-progress | Out-Null; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          & $iscc /Qp "/DAppVersion=$env:VERSION_NUM" "/DSourceDir=$PWDuild\windowsdunner\Release" windows-installer.iss
+          & $iscc /Qp "/DAppVersion=$env:VERSION_NUM" "/DSourceDir=$PWD/build/windows/x64/runner/Release" windows-installer.iss
           if (-not (Test-Path dist\Firefly-Setup.exe)) { throw "installer not produced" }
 
       - uses: actions/upload-artifact@v4
