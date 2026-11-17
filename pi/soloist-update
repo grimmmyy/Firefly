@@ -1,9 +1,24 @@
 #!/bin/sh
-# Refresh Spotify Soloist (builds expire after 90 days); restart spotcast if it changed.
-# Installed at /usr/local/sbin/soloist-update, run weekly by soloist-update.timer.
-set -e
-T=$(mktemp -d); trap "rm -rf $T" EXIT
-curl -fsSL -o $T/s.tgz https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz
-tar -xzf $T/s.tgz -C $T
-NEW=$($T/soloist --version); OLD=$(/usr/local/bin/soloist --version 2>/dev/null || true)
-if [ "$NEW" != "$OLD" ]; then install -m 755 $T/soloist /usr/local/bin/soloist; systemctl restart spotcast; echo "updated: $NEW"; else echo "current: $OLD"; fi
+# Refresh Spotify Soloist (builds expire 90 days after their build date).
+# Runs daily via soloist-update.timer; restarts spotcast only when the build
+# actually changed, and only while nothing is playing (else retries next run,
+# unless the current build is within 3 days of expiring).
+STATE=/var/lib/spotcast-user/update.json
+now=$(date +%s)
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+write() { printf '{"checked": %s, "result": "%s", "version": "%s"}\n' "$now" "$1" "$2" > "$STATE"; chmod 644 "$STATE"; }
+OLD=$(/usr/local/bin/soloist --version 2>/dev/null || true)
+if ! curl -fsSL -o "$T/s.tgz" https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz \
+   || ! tar -xzf "$T/s.tgz" -C "$T" || ! NEW=$("$T/soloist" --version); then
+  write "download-failed" "$OLD"; echo "download failed"; exit 1
+fi
+if [ "$NEW" = "$OLD" ]; then write "current" "$OLD"; echo "current: $OLD"; exit 0; fi
+PLAYING=$(curl -s -m 5 http://127.0.0.1:8090/api/status | grep -c '"playing": true')
+DAYS=$(curl -s -m 5 http://127.0.0.1:8090/api/status | sed -n 's/.*"days_left": \([0-9]*\).*/\1/p')
+if [ "$PLAYING" != "0" ] && [ "${DAYS:-0}" -gt 3 ]; then
+  write "deferred-playing" "$OLD"; echo "newer build available, deferred (playing)"; exit 0
+fi
+install -m 755 "$T/soloist" /usr/local/bin/soloist
+write "updated" "$NEW"
+systemctl restart spotcast
+echo "updated: $NEW"

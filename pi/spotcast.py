@@ -84,6 +84,9 @@ IDLE_HANDBACK_MIN = float(os.environ.get("SPOTCAST_IDLE_MIN", "20"))
 NTFY_TOPIC = os.environ.get("SPOTCAST_NTFY_TOPIC", "")          # e.g. spotcast-xyz
 DISCORD_WEBHOOK = os.environ.get("SPOTCAST_DISCORD_WEBHOOK", "")
 EVENT_LOG = "/var/lib/spotcast-user/events.jsonl"
+UPDATE_STATE = "/var/lib/spotcast-user/update.json"
+MAX_DB = float(os.environ.get("SPOTCAST_MAX_DB", "-10"))   # app volume ceiling
+sleep_timer = {"until": None}
 tune = {"t0": None, "drained": 0.0, "drain_left": 0.0, "last": None}
 BUF = {"target": BUF_TARGET}
 
@@ -699,7 +702,8 @@ def idle_handback():
             continue
         if health["handed_back"] or not prev_receiver.get("saved"):
             continue
-        if time.time() - health["last_playing"] < IDLE_HANDBACK_MIN * 60:
+        if health["last_playing"] and \
+                time.time() - health["last_playing"] < IDLE_HANDBACK_MIN * 60:
             continue
         pw, inp = receiver_status()
         if pw != "On" or inp != "PC":
@@ -724,6 +728,70 @@ def idle_handback():
 
 
 prev_receiver = {}
+
+
+def receiver_volume():
+    try:
+        r = ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
+                '</Basic_Status></Main_Zone></YAMAHA_AV>')
+        m = re.search(r"<Volume><Lvl><Val>(-?\d+)</Val>", r)
+        mute = re.search(r"<Mute>(\w+)</Mute>", r)
+        return (int(m.group(1)) / 10 if m else None,
+                (mute.group(1) == "On") if mute else None)
+    except Exception:
+        return None, None
+
+
+def set_receiver_volume(db):
+    db = max(-80.5, min(MAX_DB, round(float(db) * 2) / 2))   # 0.5 dB steps
+    ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Volume><Lvl><Val>%d</Val><Exp>1</Exp>'
+        '<Unit>dB</Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>' % int(db * 10))
+    return db
+
+
+def hand_back_now():
+    health["last_playing"] = 0
+    health["handed_back"] = False
+    for x in slots.slots:
+        if x.is_active():
+            x.ctl("pause")
+            x.playing = False
+    if not prev_receiver.get("saved"):
+        prev_receiver.update(power="On", input=None, saved=True)
+
+
+def sleep_watch():
+    while True:
+        time.sleep(5)
+        u = sleep_timer["until"]
+        if u and time.time() >= u:
+            sleep_timer["until"] = None
+            log.info("sleep timer: pausing and handing receiver back")
+            hand_back_now()
+            prev_receiver.update(power="Standby", saved=True)   # sleep => standby
+            health["last_playing"] = 0
+
+
+def update_info():
+    try:
+        d = json.load(open(UPDATE_STATE))
+    except Exception:
+        d = {}
+    d["days_left"] = health["soloist_days_left"]
+    return d
+
+
+def queue(n=5):
+    for x in slots.slots:
+        if x.playing:
+            try:
+                out = subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{x.port}",
+                                      "queue", str(n)], capture_output=True, text=True,
+                                     timeout=4).stdout
+                return [l.strip() for l in out.splitlines() if l.strip()][:n]
+            except Exception:
+                return []
+    return []
 
 
 def receiver_status():
@@ -918,8 +986,15 @@ def now_playing():
 
 def api_status():
     pw, inp = receiver_status()
+    vol, mute = receiver_volume()
+    sl = sleep_timer["until"]
     return {
-        "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"]},
+        "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"],
+                     "volume_db": vol, "mute": mute, "max_db": MAX_DB},
+        "queue": queue(),
+        "sleep_s": max(0, int(sl - time.time())) if sl else 0,
+        "update": update_info(),
+        "idle_handback_min": IDLE_HANDBACK_MIN,
         "playing": any(x.playing for x in slots.slots),
         "now_playing": now_playing(),
         "accounts": sum(1 for x in slots.slots if x.paired),
@@ -967,6 +1042,21 @@ class Handler(BaseHTTPRequestHandler):
                 v = html.escape(arg("input"))
                 ync(f'<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>{v}</Input_Sel>'
                     '</Input></Main_Zone></YAMAHA_AV>'); out = {"ok": True}
+            elif p.path == "/api/receiver/volume":
+                out = {"ok": True, "db": set_receiver_volume(arg("db"))}
+            elif p.path == "/api/receiver/mute":
+                v = "On" if arg("on") in ("1", "true", "on") else "Off"
+                ync(f'<YAMAHA_AV cmd="PUT"><Main_Zone><Volume><Mute>{v}</Mute>'
+                    '</Volume></Main_Zone></YAMAHA_AV>'); out = {"ok": True}
+            elif p.path == "/api/sleep":
+                m = float(arg("min") or 0)
+                sleep_timer["until"] = time.time() + m * 60 if m > 0 else None
+                out = {"ok": True}
+            elif p.path == "/api/handback":
+                hand_back_now(); out = {"ok": True}
+            elif p.path == "/api/update":
+                subprocess.Popen(["sudo", "-n", "/usr/local/sbin/soloist-update"])
+                out = {"ok": True}
             elif p.path == "/api/control":
                 cmd = arg("cmd")
                 if cmd not in ("pause", "play", "next", "prev"):
@@ -1115,6 +1205,7 @@ def main():
     threading.Thread(target=buffer_tuner, daemon=True).start()
     threading.Thread(target=health_monitor, daemon=True).start()
     threading.Thread(target=idle_handback, daemon=True).start()
+    threading.Thread(target=sleep_watch, daemon=True).start()
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:
