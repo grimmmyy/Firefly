@@ -160,6 +160,32 @@ class _ReceiverTab extends StatelessWidget {
   final CastController controller;
   const _ReceiverTab({required this.controller});
 
+  Future<void> _addByIp(BuildContext context) async {
+    final ctrl = TextEditingController(text: '192.168.1.7');
+    final ip = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Receiver IP address'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text),
+              child: const Text('Add')),
+        ],
+      ),
+    );
+    if (ip != null && ip.trim().isNotEmpty) {
+      await controller.addReceiverByIp(ip);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = controller;
@@ -188,6 +214,12 @@ class _ReceiverTab extends StatelessWidget {
               onPressed: c.discover,
               icon: const Icon(Icons.search),
               label: const Text('Scan again'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () => _addByIp(context),
+              icon: const Icon(Icons.edit),
+              label: const Text('Enter receiver IP'),
             ),
           ],
         ),

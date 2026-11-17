@@ -19,25 +19,65 @@ class UpnpClient {
     String? title,
     String? mime,
   }) async {
-    final metadata = _didlLite(mediaUrl, title: title, mime: mime);
-    await _soap(
-      renderer.avTransportControlUrl,
-      _avt,
-      'SetAVTransportURI',
-      {
-        'InstanceID': '0',
-        'CurrentURI': mediaUrl,
-        'CurrentURIMetaData': metadata,
-      },
-    );
+    await _selectYamahaNetInput();
+    Future<void> set(String metadata) => _soap(
+          renderer.avTransportControlUrl,
+          _avt,
+          'SetAVTransportURI',
+          {
+            'InstanceID': '0',
+            'CurrentURI': mediaUrl,
+            'CurrentURIMetaData': metadata,
+          },
+        );
+    try {
+      await set(_didlLite(mediaUrl, title: title, mime: mime));
+    } catch (_) {
+      // The RX-V671 rejects DIDL-Lite metadata with a 500; it accepts none.
+      await set('');
+    }
   }
 
-  Future<void> play() => _soap(
-        renderer.avTransportControlUrl,
-        _avt,
-        'Play',
-        {'InstanceID': '0', 'Speed': '1'},
-      );
+  Future<void> play() async {
+    try {
+      await _soap(renderer.avTransportControlUrl, _avt, 'Play',
+          {'InstanceID': '0', 'Speed': '1'});
+    } catch (_) {
+      // Yamaha returns 501 when not on its DLNA input; switch and retry once.
+      await _selectYamahaNetInput(force: true);
+      await _soap(renderer.avTransportControlUrl, _avt, 'Play',
+          {'InstanceID': '0', 'Speed': '1'});
+    }
+  }
+
+  bool get _isYamaha =>
+      renderer.manufacturer.toLowerCase().contains('yamaha') ||
+      renderer.modelName.toUpperCase().startsWith('RX-');
+
+  /// Yamaha AVRs only accept AVTransport Play while on the "PC" (DLNA server)
+  /// input; switch via the YNC control API on port 80. Best effort.
+  Future<void> _selectYamahaNetInput({bool force = false}) async {
+    if (!_isYamaha && !force) return;
+    final host = renderer.location.host;
+    Future<String> ync(String xml) async => (await http
+            .post(Uri.parse('http://$host/YamahaRemoteControl/ctrl'),
+                headers: {'Content-Type': 'text/xml'}, body: xml)
+            .timeout(const Duration(seconds: 4)))
+        .body;
+    try {
+      final status = await ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>'
+          'GetParam</Basic_Status></Main_Zone></YAMAHA_AV>');
+      if (status.contains('<Input_Sel>PC</Input_Sel>') &&
+          status.contains('<Power>On</Power>')) {
+        return;
+      }
+      await ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Power_Control><Power>On'
+          '</Power></Power_Control></Main_Zone></YAMAHA_AV>');
+      await ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>PC'
+          '</Input_Sel></Input></Main_Zone></YAMAHA_AV>');
+      await Future.delayed(const Duration(seconds: 3));
+    } catch (_) {}
+  }
 
   Future<void> pause() => _soap(
         renderer.avTransportControlUrl,

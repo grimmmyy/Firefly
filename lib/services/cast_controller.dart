@@ -57,7 +57,22 @@ class CastController extends ChangeNotifier {
     discovering = true;
     notifyListeners();
     try {
+      final prefs = await SharedPreferences.getInstance();
+      _ssdp.extraLocations = {
+        ...(prefs.getStringList('receiverUrls') ?? const []),
+        // Default seed for the home RX-V671.
+        ...SsdpDiscovery.candidatesFor('192.168.1.7'),
+      };
       renderers = await _ssdp.discover();
+      // Remember every working description URL for next time.
+      await prefs.setStringList('receiverUrls',
+          {...renderers.map((r) => r.location.toString())}.toList());
+      if (selected == null && renderers.length == 1) select(renderers.first);
+      if (selected == null) {
+        final yamaha = renderers.where((r) =>
+            r.modelName.toUpperCase().startsWith('RX-'));
+        if (yamaha.isNotEmpty) select(yamaha.first);
+      }
       if (selected != null &&
           !renderers.any((r) => r.uniqueKey == selected!.uniqueKey)) {
         selected = null;
@@ -67,6 +82,15 @@ class CastController extends ChangeNotifier {
       discovering = false;
       notifyListeners();
     }
+  }
+
+  /// Add a receiver by IP address (or full description URL) and rescan.
+  Future<void> addReceiverByIp(String ip) async {
+    final prefs = await SharedPreferences.getInstance();
+    final existing = prefs.getStringList('receiverUrls') ?? [];
+    await prefs.setStringList('receiverUrls',
+        {...existing, ...SsdpDiscovery.candidatesFor(ip)}.toList());
+    await discover();
   }
 
   void select(Renderer r) {

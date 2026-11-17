@@ -78,6 +78,11 @@ class SsdpDiscovery {
     await sub.cancel();
     socket.close();
 
+    // iOS blocks multicast without Apple's restricted entitlement, and Android
+    // often drops replies, so also try known/likely description URLs directly.
+    locations.addAll(extraLocations);
+    locations.addAll(await _sweepSubnet());
+
     final renderers = <Renderer>[];
     for (final loc in locations) {
       try {
@@ -93,6 +98,58 @@ class SsdpDiscovery {
       final k = '${r.friendlyName}|${r.location.host}';
       return seen.add(k);
     }).toList();
+  }
+
+  /// Description URLs to always probe (saved/manual receivers).
+  Set<String> extraLocations = {};
+
+  /// Well-known description paths for common renderers.
+  static const probePaths = [
+    ':49154/MediaRenderer/desc.xml', // Yamaha (RX-V671 etc.)
+    ':8080/MediaRenderer/desc.xml',
+    ':9197/dmr', // Samsung TVs
+  ];
+
+  /// Build candidate description URLs for a host or IP the user typed.
+  static List<String> candidatesFor(String hostOrUrl) {
+    final h = hostOrUrl.trim();
+    if (h.startsWith('http')) return [h];
+    return probePaths.map((p) => 'http://$h$p').toList();
+  }
+
+  /// Unicast TCP sweep of the local /24 for known renderer ports.
+  Future<Set<String>> _sweepSubnet() async {
+    final found = <String>{};
+    String? prefix;
+    for (final iface in await NetworkInterface.list(
+        type: InternetAddressType.IPv4, includeLinkLocal: false)) {
+      for (final a in iface.addresses) {
+        final ip = a.address;
+        if (ip.startsWith('192.168.') || ip.startsWith('10.') ||
+            ip.startsWith('172.')) {
+          prefix ??= ip.substring(0, ip.lastIndexOf('.') + 1);
+        }
+      }
+    }
+    if (prefix == null) return found;
+    const ports = {49154: '/MediaRenderer/desc.xml', 9197: '/dmr'};
+    // Batched to stay well under iOS's per-process socket limit.
+    final targets = <MapEntry<String, MapEntry<int, String>>>[];
+    for (var i = 1; i < 255; i++) {
+      for (final e in ports.entries) {
+        targets.add(MapEntry('$prefix$i', e));
+      }
+    }
+    for (var start = 0; start < targets.length; start += 64) {
+      final batch = targets.skip(start).take(64);
+      await Future.wait(batch.map((t) => Socket.connect(t.key, t.value.key,
+                  timeout: const Duration(milliseconds: 600))
+              .then((s) {
+            s.destroy();
+            found.add('http://${t.key}:${t.value.key}${t.value.value}');
+          }).catchError((_) {})));
+    }
+    return found;
   }
 
   String? _headerValue(String response, String name) {
