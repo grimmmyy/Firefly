@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Firefly logo">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0" stop-color="#2a1d0e"/>
+      <stop offset="1" stop-color="#0e0e10"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#ffe2a8" stop-opacity="1"/>
+      <stop offset="0.35" stop-color="#ffb347" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffb347" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b3b44"/>
+      <stop offset="1" stop-color="#1c1c22"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- sound waves radiating from the lantern -->
+  <g fill="none" stroke="#ffb347" stroke-linecap="round">
+    <path d="M318 330 a70 70 0 0 1 0 -0" stroke-width="0"/>
+    <path d="M330 300 q44 30 0 92" stroke-width="16" opacity="0.95"/>
+    <path d="M362 270 q76 60 0 152" stroke-width="16" opacity="0.6"/>
+    <path d="M394 240 q108 90 0 212" stroke-width="16" opacity="0.3"/>
+  </g>
+  <!-- glow -->
+  <circle cx="262" cy="346" r="120" fill="url(#glow)"/>
+  <!-- wings -->
+  <ellipse cx="206" cy="182" rx="58" ry="92" transform="rotate(-28 206 182)" fill="#cfd8ff" fill-opacity="0.28" stroke="#e6ebff" stroke-opacity="0.55" stroke-width="5"/>
+  <ellipse cx="300" cy="176" rx="58" ry="92" transform="rotate(26 300 176)" fill="#cfd8ff" fill-opacity="0.28" stroke="#e6ebff" stroke-opacity="0.55" stroke-width="5"/>
+  <!-- head + body -->
+  <circle cx="254" cy="160" r="34" fill="url(#body)"/>
+  <path d="M254 186 c-38 0 -52 40 -48 88 c3 40 22 64 48 64 c26 0 45 -24 48 -64 c4 -48 -10 -88 -48 -88z" fill="url(#body)"/>
+  <!-- glowing lantern abdomen -->
+  <ellipse cx="258" cy="336" rx="44" ry="50" fill="#ffd27a"/>
+  <ellipse cx="258" cy="330" rx="26" ry="30" fill="#fff4d6"/>
+  <!-- antennae -->
+  <g fill="none" stroke="#3b3b44" stroke-width="7" stroke-linecap="round">
+    <path d="M240 132 q-16 -40 -46 -50"/>
+    <path d="M268 132 q16 -40 46 -50"/>
+  </g>
+  <circle cx="192" cy="80" r="9" fill="#ffb347"/>
+  <circle cx="316" cy="80" r="9" fill="#ffb347"/>
+</svg>

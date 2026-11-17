@@ -3,7 +3,17 @@ name: Build Firefly
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "pi/**", "assets/*.svg"]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Tags (v1.2.3) build that version; everything else builds 0.2.<run>.
+  VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('0.2.{0}', github.run_number) }}
 
 jobs:
   android:
@@ -26,8 +36,15 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Version
+        shell: bash
+        run: echo "VERSION_NUM=${VERSION#v}" >> "$GITHUB_ENV"
+
+      - name: App icons
+        run: dart run flutter_launcher_icons -f icons-mobile.yaml
+
       - name: Build release APK
-        run: flutter build apk --release --build-name=0.2.${{ github.run_number }} --build-number=${{ github.run_number }}
+        run: flutter build apk --release --build-name=${{ env.VERSION_NUM }} --build-number=${{ github.run_number }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -50,8 +67,15 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Version
+        shell: bash
+        run: echo "VERSION_NUM=${VERSION#v}" >> "$GITHUB_ENV"
+
+      - name: App icons
+        run: dart run flutter_launcher_icons -f icons-mobile.yaml
+
       - name: Build iOS (no codesign)
-        run: flutter build ios --release --no-codesign --build-name=0.2.${{ github.run_number }} --build-number=${{ github.run_number }}
+        run: flutter build ios --release --no-codesign --build-name=${{ env.VERSION_NUM }} --build-number=${{ github.run_number }}
 
       - name: Package unsigned IPA
         run: |
@@ -82,8 +106,15 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Version
+        shell: bash
+        run: echo "VERSION_NUM=${VERSION#v}" >> "$GITHUB_ENV"
+
+      - name: App icons
+        run: dart run flutter_launcher_icons -f icons-windows.yaml
+
       - name: Build Windows release
-        run: flutter build windows --release --build-name=0.2.${{ github.run_number }} --build-number=${{ github.run_number }}
+        run: flutter build windows --release --build-name=${{ env.VERSION_NUM }} --build-number=${{ github.run_number }}
 
       - name: Package zip
         shell: pwsh
@@ -94,3 +125,40 @@ jobs:
           name: firefly-windows
           path: Firefly-windows.zip
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    needs: [android, ios, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+        continue-on-error: true
+      - name: Collect assets
+        run: |
+          V="${GITHUB_REF_NAME}"
+          mkdir -p out
+          [ -f dist/firefly-android-apk/app-release.apk ] && cp dist/firefly-android-apk/app-release.apk "out/Firefly-${V}-android.apk"
+          [ -f dist/firefly-ios-unsigned-ipa/Firefly-unsigned.ipa ] && cp dist/firefly-ios-unsigned-ipa/Firefly-unsigned.ipa "out/Firefly-${V}-ios-unsigned.ipa"
+          [ -f dist/firefly-windows/Firefly-windows.zip ] && cp dist/firefly-windows/Firefly-windows.zip "out/Firefly-${V}-windows-x64.zip"
+          tar -czf "out/spotcast-pi-bridge-${V}.tar.gz" pi
+          (cd out && sha256sum * > SHA256SUMS.txt)
+          ls -la out
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME}"
+          NOTES=".github/release-notes/${V}.md"
+          if gh release view "$V" >/dev/null 2>&1; then
+            gh release upload "$V" out/* --clobber
+          else
+            if [ -f "$NOTES" ]; then
+              gh release create "$V" out/* --title "Firefly ${V}" --notes-file "$NOTES"
+            else
+              gh release create "$V" out/* --title "Firefly ${V}" --generate-notes
+            fi
+          fi

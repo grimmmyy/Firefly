@@ -1,63 +1,173 @@
-# Firefly
+<p align="center">
+  <img src="assets/logo.png" width="160" alt="Firefly logo">
+</p>
 
-Cast local audio, podcasts, and internet radio from your phone to the Yamaha RX-V671 (or any DLNA/UPnP MediaRenderer) over Wi-Fi — no extra adapters, no computer.
+<h1 align="center">Firefly</h1>
 
-## What it does
+<p align="center">
+  <b>Give a 2011 Yamaha receiver Spotify Connect, internet radio and phone playback, with no dongles, no adapters and no PC.</b>
+</p>
 
-- Discovers DLNA/UPnP receivers on your LAN via SSDP.
-- Runs a tiny on-device HTTP server (with HTTP Range support) so the receiver can pull local audio files directly over Wi-Fi.
-- Drives the receiver via UPnP AVTransport (play / pause / stop) and RenderingControl (volume).
-- Comes with a few preloaded internet radio streams and lets you save your own.
+<p align="center">
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/grimmmyy/Firefly?include_prereleases&label=release&color=ffb347"></a>
+  <a href="../../actions/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/grimmmyy/Firefly/build.yml?label=build"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platforms-Android%20%7C%20iOS%20%7C%20Windows%20%7C%20Raspberry%20Pi-1ed760">
+  <img alt="License" src="https://img.shields.io/github/license/grimmmyy/Firefly?color=lightgrey">
+</p>
 
-## What it does NOT do
+---
 
-- **Spotify / Apple Music / Tidal / Netflix audio.** Those apps mark their audio as DRM-protected at the OS level. On Android the stream comes through as silence; on iOS third-party apps can't capture other apps' audio at all. This is a platform limitation, not a Firefly one. For Spotify specifically, use Spotify Connect on a smart TV, Fire Stick, Chromecast, Apple TV, or console that's HDMI'd into the receiver.
-- iOS has no system-audio capture for any app, so local files and stream URLs are the only inputs on iPhone.
+## Why this exists
 
-## Receiver setup (one-time)
+The **Yamaha RX-V671** (2011) is a great amplifier with a dated network stack: no Wi-Fi, no Bluetooth,
+no AirPlay and no Spotify Connect. What it *does* have is an Ethernet port and a DLNA/UPnP media
+renderer. Firefly uses only that renderer to bring the receiver up to date:
 
-1. Plug an Ethernet cable from the RX-V671's `NETWORK` port to your home router.
-2. On the Yamaha's on-screen `Setup → Network`, confirm it got an IP.
-3. On the Yamaha remote, press `NET` once so the receiver is listening on the network input. Set `Network Standby` to `On` if you want to wake it from the app.
+| You want to… | Firefly gives you… |
+|---|---|
+| Play Spotify from any phone, with Spotify's own app | **Spotify Connect** device "Living Room (RX-V671)" served by a Raspberry Pi bridge |
+| Let everyone in the house use their **own** Spotify account | One player per account; the newest player takes over automatically, with no sign-in or sign-out |
+| Listen to internet radio | **Firefly app**: search 40,000+ stations and send them to the receiver |
+| Play music files from your phone or PC | **Firefly app**: queue local MP3/FLAC/WAV/AAC files |
+| Control the receiver itself | Power, input, real-dB volume, mute, sleep timer, from the app |
 
-Your phone must be on the same Wi-Fi network (and not on a "Guest" SSID with client isolation).
+Nothing is bought, plugged into the receiver's inputs, or left running on a computer.
 
-## Installing the builds
+## How it works
 
-CI builds both targets on every push. Grab them from the GitHub Actions run for your commit → "Artifacts":
+```mermaid
+flowchart LR
+  P["📱 Spotify app<br/>(any phone / PC)"] -- Spotify Connect --> S((Spotify))
+  S -- audio --> SO["Raspberry Pi<br/>Spotify Soloist"]
+  SO --> PW["PipeWire<br/>virtual speaker"]
+  PW --> SC["spotcast<br/>WAV stream + control"]
+  SC -- "UPnP AVTransport<br/>+ Yamaha YNC" --> R["🔊 Yamaha RX-V671<br/>(DLNA renderer)"]
+  F["📱 Firefly app"] -- "radio · files · control" --> R
+  F -- "/api" --> SC
+```
 
-- **`firefly-android-apk`** → `app-release.apk`. Copy to the phone and open it (allow "install from unknown sources"). The APK is self-signed with the debug key so it installs without a Play Store account.
-- **`firefly-ios-unsigned-ipa`** → `Firefly-unsigned.ipa`. Install with [AltStore](https://altstore.io/) or [Sideloadly](https://sideloadly.io/) using your free Apple ID. It will need re-signing every 7 days (that's Apple's free-tier limit, not something the app can change).
+* **[Spotify Soloist](https://developer.spotify.com/documentation/soloist)**, Spotify's official headless
+  Connect player, runs on the Pi and plays into a PipeWire null sink.
+  (librespot is not used: Spotify refuses audio keys to it for newer accounts; see
+  [librespot#1649](https://github.com/librespot-org/librespot/issues/1649).)
+* **spotcast** (`pi/spotcast.py`) captures that sink and serves it as an uncompressed WAV stream.
+  It tells the receiver to switch to its `PC` (DLNA) input and play the stream over UPnP, and it
+  powers the receiver on through Yamaha's YNC control API when needed.
+* The **Firefly app** (Flutter) talks UPnP directly to the receiver for radio and files, and uses
+  spotcast's small JSON API for Spotify status, receiver control and household management.
 
-## Building locally
+## Features
 
-Requirements: Flutter 3.24+, Android SDK (for APK), Xcode 15+ on macOS (for IPA).
+**Spotify (via the Pi bridge)**
+- Shows up in Spotify as **Living Room (RX-V671)**: pick it from the device list like any speaker
+- **Multi-account**: each household account gets its own player; the newest player wins and the rest pause
+- **"Add me" appears only when needed**: a new phone opening Spotify on the Wi-Fi sees *Living Room - Add me*
+  for 10 minutes; registered devices don't
+- Automatic **input switch and power-on**, and **hand back** to the previous input (or standby) after 20 idle minutes
+- **Low latency**: ≈ 0.3 s from the Pi to the speakers (see [Latency](#latency))
+- **Self-healing**: watchdog, stall detection with adaptive buffering, auto-restart, and a daily Soloist auto-update
+- Optional **alerts** (ntfy or Discord): receiver offline, update failures, repeated dropouts, Pi reboot
 
-```bash
-flutter create . --platforms=android,ios --org com.firefly --project-name firefly
+**Firefly app (Android · iOS · Windows)**
+- **Home**: receiver power, input chips, volume in dB with a safety ceiling, mute, Spotify now playing,
+  sleep timer, hand back, latency and health
+- **Radio**: search the [Radio Browser](https://www.radio-browser.info/) directory, browse genres, keep favourites
+- **Library**: multi-file queue with auto-advance, and recently played
+- **Settings**: people and devices, receiver discovery (SSDP plus a unicast sweep, so it works on iOS without
+  multicast entitlements), bridge address, update status
+- Mini player and full-screen Now Playing on every screen
+
+## Requirements
+
+| | |
+|---|---|
+| Receiver | Yamaha RX-V671 (other Yamaha RX-V/RX-A models with DLNA + YNC very likely work) wired to your router |
+| Bridge | Raspberry Pi 3/4/5 (64-bit) on the same LAN; Ethernet recommended |
+| Spotify | **Premium** account to create the free Soloist API key; listeners' accounts likely also need Premium |
+| Phones | Android 8+, iOS 15+ (sideloaded), or Windows 10/11 |
+
+## Setup
+
+### 1. Receiver
+1. Plug the receiver's **NETWORK** port into your router.
+2. On the receiver: *Setup → Network → Network Standby → On* (lets the bridge wake it).
+3. Optional but recommended: give it a DHCP reservation in your router.
+
+### 2. Raspberry Pi bridge
+1. Create a Soloist API key at <https://developer.spotify.com/dashboard/soloist> (Premium account).
+2. On the Pi:
+   ```sh
+   git clone https://github.com/grimmmyy/Firefly.git
+   cd Firefly/pi
+   sudo SOLOIST_API_KEY=spak_xxx RECEIVER_IP=192.168.1.7 ./install.sh
+   ```
+   Optional: `SPEAKER_NAME="Kitchen (RX-V671)"`, `NTFY_TOPIC=my-private-topic`, `DISCORD_WEBHOOK=https://…`
+3. In Spotify on the same Wi-Fi, pick **Living Room - Add me** once. From then on it appears as
+   **Living Room (RX-V671)** on your account.
+4. Status page: `http://<pi-ip>:8090` · JSON: `http://<pi-ip>:8090/api/status`
+
+The API key is stored only in `/etc/spotcast/soloist.env` (mode 600) on the Pi.
+
+### 3. Firefly app
+Download from the [latest release](../../releases/latest):
+
+| Platform | File | Install |
+|---|---|---|
+| Android | `Firefly-vX-android.apk` | Open it, allow "install unknown apps" |
+| iOS | `Firefly-vX-ios-unsigned.ipa` | Sideload with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) (free Apple ID: re-sign every 7 days) |
+| Windows | `Firefly-vX-windows-x64.zip` | Unzip anywhere, run `firefly.exe` (keep the folder together) |
+
+On first launch, allow **Local Network** access (iOS) and the Windows Firewall prompt (**Private** networks),
+because the receiver pulls audio from the app.
+
+## Latency
+
+Measured on an RX-V671 over Ethernet:
+
+| Stage | Time |
+|---|---|
+| Play command → receiver reports `PLAYING` | ~40 ms |
+| Audio queued inside the Pi | 5–15 ms |
+| Receiver DLNA buffer, **trimmed** | ~0.30–0.38 s (untrimmed it settles at a random 0.25–0.8 s per connection) |
+
+spotcast measures the receiver's buffer at each `RelTime` tick and withholds *silent* audio to trim it to the
+receiver's floor (~0.3 s). The output format doesn't change the buffer (MP3, WAV 44.1–96 kHz and 16/24-bit
+were tested), and the RX-V671 rejects `audio/L16`.
+
+## Receiver quirks (RX-V671)
+
+- `AVTransport.Play` returns **501** unless the input is **`PC`**; switch with YNC first.
+- `SetAVTransportURI` with DIDL-Lite metadata returns **500**; send empty metadata.
+- Accepts streaming WAV with an open-ended header; rejects L16.
+- YNC control: `POST http://<receiver>/YamahaRemoteControl/ctrl`.
+
+## Building from source
+
+```sh
+flutter create . --platforms=android,ios,windows --org com.firefly --project-name firefly
 flutter pub get
+dart run flutter_launcher_icons -f icons-mobile.yaml   # or icons-windows.yaml
 flutter build apk --release        # Android
-flutter build ios --release --no-codesign   # iOS (macOS only)
+flutter build ios --release --no-codesign
+flutter build windows --release
 ```
 
-Unsigned IPA packaging is done in `.github/workflows/build.yml`.
+CI builds every push. Pushing a `v*` tag builds all platforms and publishes a GitHub Release with the
+APK, unsigned IPA, Windows zip, Pi bridge tarball and checksums.
 
-## Repo layout
+## Limitations
 
-```
-lib/
-  main.dart
-  ui/home_page.dart         # Tabs: Receiver / Stations / Files + transport bar
-  services/
-    ssdp.dart               # M-SEARCH + device description parsing
-    upnp_client.dart        # SOAP calls for AVTransport + RenderingControl
-    media_server.dart       # Local HTTP server with Range support for local files
-    cast_controller.dart    # App-level state, orchestration
-android/                    # Minimal Android host; `flutter create` fills the rest in CI
-ios/                        # Minimal iOS host; `flutter create` fills the rest in CI
-.github/workflows/build.yml # Produces APK + unsigned IPA
-```
+- Spotify playback needs the Pi; iOS can't capture other apps' audio, so the phone can't be the bridge.
+- Soloist builds expire 90 days after release; the Pi updates itself daily.
+- Soloist only appears to the account it is paired with; Firefly works around this with one player per
+  account and a self-managing "Add me" slot.
+
+## Legal
+
+Firefly uses Spotify's official Soloist binary, downloaded on your Pi from Spotify's CDN; nothing Spotify
+is redistributed here. By using it you accept Spotify's terms. "Spotify" and "Yamaha" are trademarks of
+their owners; this project is not affiliated with either.
 
 ## License
 
-See `LICENSE`.
+[MIT](LICENSE)
