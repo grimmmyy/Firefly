@@ -185,6 +185,9 @@ class Slot:
             threading.Thread(target=self.watch, args=(self.proc,), daemon=True).start()
             rc = self.proc.wait()
             self.playing = False
+            if getattr(self, "retired", False):
+                shutil.rmtree(self.dir, ignore_errors=True)
+                return
             if rc == 10:
                 log.error("soloist build expired; run soloist-update")
             if getattr(self, "_restart", False):
@@ -212,6 +215,7 @@ class Slot:
                 if t == "auth_state" and ev.get("logged_in") and not self.paired:
                     open(f"{self.dir}/paired", "w").close()
                     log.info("slot %d claimed by a new account", self.n)
+                    self.mgr.add_until = 0
                     self.mgr.ensure_spare()
                     self.pending_rename = True
                 elif t == "playback_state":
@@ -226,10 +230,42 @@ class Slot:
             time.sleep(2)
 
 
+ADD_WINDOW = int(os.environ.get("SPOTCAST_ADD_WINDOW", "600"))
+# Default: always keep one unclaimed "Add me" device visible.
+# Set SPOTCAST_PERMANENT_SPARE=0 to only show it after tapping "Add a new person".
+PERMANENT_SPARE = os.environ.get("SPOTCAST_PERMANENT_SPARE", "1") != "0"
+
+
 class SlotManager:
     def __init__(self):
         self.slots = []
         self.lock = threading.Lock()
+        self.add_until = 0.0
+
+    def open_add_window(self):
+        self.add_until = time.time() + ADD_WINDOW
+        log.info("add window open for %ds", ADD_WINDOW)
+        self.ensure_spare()
+
+    def add_window_left(self):
+        if PERMANENT_SPARE:
+            return 10 ** 9
+        return max(0, int(self.add_until - time.time()))
+
+    def reap(self):
+        # Remove the unclaimed spare once the add window closes, so every
+        # account sees exactly one "Living Room" entry in normal use.
+        while True:
+            time.sleep(10)
+            if self.add_window_left() > 0:
+                continue
+            with self.lock:
+                for sl in [x for x in self.slots if not x.paired]:
+                    log.info("add window closed; removing spare slot %d", sl.n)
+                    sl.retired = True
+                    if sl.proc:
+                        sl.proc.terminate()
+                    self.slots.remove(sl)
 
     def start(self):
         os.makedirs(SLOT_ROOT, exist_ok=True)
@@ -239,8 +275,14 @@ class SlotManager:
             open(f"{SLOT_ROOT}/0/paired", "w").close()
         ns = sorted(int(d) for d in os.listdir(SLOT_ROOT) if d.isdigit())
         for n in ns:
-            self._spawn(n)
+            if os.path.exists(f"{SLOT_ROOT}/{n}/paired"):
+                self._spawn(n)
+            else:
+                shutil.rmtree(f"{SLOT_ROOT}/{n}", ignore_errors=True)
+        if not self.slots:          # brand-new install: let the first person in
+            self.add_until = time.time() + ADD_WINDOW
         self.ensure_spare()
+        threading.Thread(target=self.reap, daemon=True).start()
 
     def _spawn(self, n):
         sl = Slot(self, n)
@@ -250,6 +292,8 @@ class SlotManager:
 
     def ensure_spare(self):
         with self.lock:
+            if self.add_window_left() <= 0:
+                return
             if any(not s.paired for s in self.slots):
                 return
             if len(self.slots) >= MAX_SLOTS:
@@ -409,6 +453,34 @@ class Handler(BaseHTTPRequestHandler):
             elif e == "volume_changed" and qs.get("v"):
                 threading.Thread(target=set_volume, args=(qs["v"][0],), daemon=True).start()
             self.send_response(204); self.end_headers()
+        elif p.path in ("/", "/add"):
+            if p.path == "/add":
+                slots.open_add_window()
+                self.send_response(303); self.send_header("Location", "/"); self.end_headers()
+                return
+            left = slots.add_window_left()
+            people = sum(1 for x in slots.slots if x.paired)
+            playing = any(x.playing for x in slots.slots)
+            msg = ("<p class=on>New people: pick 'Living Room - Add me' in Spotify once.</p>"
+                   if PERMANENT_SPARE else
+                   f"<p class=on>'Living Room - Add me' is visible in Spotify for "
+                   f"{left // 60}:{left % 60:02d} more. The new person should pick it now.</p>"
+                   if left else
+                   "<form action=/add><button>Add a new person</button></form>"
+                   "<p>Shows 'Living Room - Add me' in Spotify for 10 minutes. "
+                   "They pick it once and it's theirs from then on.</p>")
+            body = f"""<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Living Room Speaker</title>{'<meta http-equiv=refresh content=5>' if left and not PERMANENT_SPARE else ''}
+<style>body{{font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;
+padding:24px 16px;max-width:480px;margin:auto}}button{{width:100%;padding:16px;font-size:17px;
+font-weight:600;border:0;border-radius:12px;background:#1db954;color:#000}}
+p{{color:#aaa;line-height:1.45}}.on{{color:#1db954}}</style>
+<h1>Living Room Speaker</h1>
+<p>{people} Spotify account{'s' if people != 1 else ''} linked &middot;
+{'playing now' if playing else 'idle'}</p>{msg}""".encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers(); self.wfile.write(body)
         elif p.path == "/status":
             body = f"clients={hub.count()} url={STREAM_URL}\n".encode()
             self.send_response(200); self.send_header("Content-Type", "text/plain")
