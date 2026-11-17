@@ -1,0 +1,1 @@
+spotcast ALL=(root) NOPASSWD: /usr/local/sbin/soloist-update

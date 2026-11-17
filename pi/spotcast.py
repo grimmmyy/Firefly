@@ -79,7 +79,13 @@ class Hub:
 # connection, with a ~0.3 s floor it refills to. Withholding silent audio for d
 # seconds shrinks its buffer by d, so we trim each connection down to TARGET.
 BUF_TARGET = float(os.environ.get("SPOTCAST_BUFFER_TARGET", "0.30"))
+BUF_TARGET_MAX = 0.60
+IDLE_HANDBACK_MIN = float(os.environ.get("SPOTCAST_IDLE_MIN", "20"))
+NTFY_TOPIC = os.environ.get("SPOTCAST_NTFY_TOPIC", "")          # e.g. spotcast-xyz
+DISCORD_WEBHOOK = os.environ.get("SPOTCAST_DISCORD_WEBHOOK", "")
+EVENT_LOG = "/var/lib/spotcast-user/events.jsonl"
 tune = {"t0": None, "drained": 0.0, "drain_left": 0.0, "last": None}
+BUF = {"target": BUF_TARGET}
 
 hub = Hub()        # mp3
 pcm_hub = Hub()    # raw big-endian PCM (L16)
@@ -365,8 +371,10 @@ class Slot:
             self.proc = subprocess.Popen(
                 ["soloist", "--device-name", self.name(),
                  "--api-key", os.environ["SOLOIST_API_KEY"], "--data-dir", self.dir,
-                 "--ws", f"127.0.0.1:{self.port}", "--initial-volume", "100"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 "--ws", f"127.0.0.1:{self.port}", "--initial-volume", "100",
+                 "--cache-size", os.environ.get("SPOTCAST_CACHE_MB", "300")],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
             threading.Thread(target=self.watch, args=(self.proc,), daemon=True).start()
             if not self.paired:
                 threading.Thread(target=devices.set_spare, args=(self.proc.pid,),
@@ -378,11 +386,21 @@ class Slot:
                 return
             if rc == 10:
                 log.error("soloist build expired; run soloist-update")
+                alert("soloist-expired", "Spotify Soloist build expired - running update")
+                subprocess.Popen(["sudo", "-n", "/usr/local/sbin/soloist-update"])
             if getattr(self, "_restart", False):
                 self._restart = False
                 continue
             log.info("slot %d exited rc=%s; restarting", self.n, rc)
             time.sleep(5)
+
+    def read_output(self, proc):
+        for line in proc.stdout:
+            m = re.search(r"client expires in (\d+) days", line)
+            if m:
+                health["soloist_days_left"] = int(m.group(1))
+            if "error" in line.lower() and "SOLOIST_API" not in line:
+                log.info("slot %d soloist: %s", self.n, line.strip()[:200])
 
     def restart(self):
         self._restart = True
@@ -580,6 +598,134 @@ def power_on():
         log.info("power on (YNC) failed: %s", e)
 
 
+health = {
+    "started": time.time(), "soloist_days_left": None, "receiver_ok": True,
+    "receiver_fail_since": None, "stalls": 0, "reconnects": 0, "last_stall": None,
+    "last_playing": time.time(), "handed_back": False,
+}
+_alert_last = {}
+
+
+def event(kind, **kw):
+    rec = {"t": int(time.time()), "kind": kind, **kw}
+    try:
+        with open(EVENT_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        if os.path.getsize(EVENT_LOG) > 2_000_000:         # keep the SD card happy
+            lines = open(EVENT_LOG).readlines()[-5000:]
+            open(EVENT_LOG, "w").writelines(lines)
+    except OSError:
+        pass
+
+
+def alert(key, text, every=6 * 3600):
+    """Push a notification (ntfy and/or Discord), rate-limited per key."""
+    event("alert", key=key, text=text)
+    log.info("ALERT %s: %s", key, text)
+    now = time.time()
+    if now - _alert_last.get(key, 0) < every:
+        return
+    _alert_last[key] = now
+    def send():
+        try:
+            if NTFY_TOPIC:
+                urllib.request.urlopen(urllib.request.Request(
+                    f"https://ntfy.sh/{NTFY_TOPIC}", data=text.encode(),
+                    headers={"Title": "Living Room Speaker", "Tags": "speaker"}), timeout=10)
+            if DISCORD_WEBHOOK:
+                urllib.request.urlopen(urllib.request.Request(
+                    DISCORD_WEBHOOK, data=json.dumps({"content": f"🔊 {text}"}).encode(),
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": "spotcast"}), timeout=10)
+        except Exception as e:
+            log.info("alert send failed: %s", e)
+    threading.Thread(target=send, daemon=True).start()
+
+
+def health_monitor():
+    """Receiver reachability, Soloist build expiry, playback stalls."""
+    last_pos, last_pos_t = None, time.time()
+    while True:
+        time.sleep(15)
+        # receiver reachable?
+        pw, inp = receiver_status()
+        if pw is None:
+            if health["receiver_fail_since"] is None:
+                health["receiver_fail_since"] = time.time()
+            elif time.time() - health["receiver_fail_since"] > 300 and health["receiver_ok"]:
+                health["receiver_ok"] = False
+                alert("receiver-down", "Receiver (RX-V671) unreachable for 5 minutes - "
+                      "check its power and network cable")
+        else:
+            if not health["receiver_ok"]:
+                alert("receiver-up", "Receiver is reachable again", every=0)
+            health["receiver_ok"], health["receiver_fail_since"] = True, None
+        # soloist expiry
+        d = health["soloist_days_left"]
+        if d is not None and d <= 10:
+            alert("soloist-expiring", f"Spotify Soloist build expires in {d} days and the "
+                  "weekly auto-update hasn't replaced it yet", every=24 * 3600)
+        # stall detection: Spotify playing on a slot, receiver position not advancing
+        try:
+            if any(x.playing for x in slots.slots) and wav_hub.count():
+                pos = position_seconds()
+                if pos is not None and pos == last_pos and time.time() - last_pos_t > 14:
+                    health["stalls"] += 1
+                    health["last_stall"] = int(time.time())
+                    event("stall", buffer=tune["last"], target=BUF["target"])
+                    log.info("playback stall detected (target %.2fs)", BUF["target"])
+                    # back off the trim if stalls follow it
+                    if BUF["target"] < BUF_TARGET_MAX:
+                        BUF["target"] = round(BUF["target"] + 0.05, 2)
+                        log.info("raising buffer target to %.2fs", BUF["target"])
+                    if health["stalls"] in (3, 10):
+                        alert("stalls", f"{health['stalls']} playback stalls today - "
+                              "receiver may be dropping the stream")
+                if pos != last_pos:
+                    last_pos, last_pos_t = pos, time.time()
+            else:
+                last_pos, last_pos_t = None, time.time()
+        except Exception:
+            pass
+
+
+def idle_handback():
+    """After IDLE_HANDBACK_MIN minutes with nothing playing, give the receiver back:
+    restore the input it was on (or standby if we woke it)."""
+    while True:
+        time.sleep(30)
+        if any(x.playing for x in slots.slots):
+            health["last_playing"], health["handed_back"] = time.time(), False
+            continue
+        if health["handed_back"] or not prev_receiver.get("saved"):
+            continue
+        if time.time() - health["last_playing"] < IDLE_HANDBACK_MIN * 60:
+            continue
+        pw, inp = receiver_status()
+        if pw != "On" or inp != "PC":
+            health["handed_back"] = True             # someone already changed it
+            prev_receiver.clear()
+            continue
+        try:
+            soap("AVTransport", "Stop", [("InstanceID", 0)])
+            if prev_receiver.get("power") != "On":
+                ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Power_Control><Power>Standby'
+                    '</Power></Power_Control></Main_Zone></YAMAHA_AV>')
+                log.info("idle: receiver back to standby")
+            elif prev_receiver.get("input") and prev_receiver["input"] != "PC":
+                ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>'
+                    f'{prev_receiver["input"]}</Input_Sel></Input></Main_Zone></YAMAHA_AV>')
+                log.info("idle: receiver back to %s", prev_receiver["input"])
+            event("handback", to=prev_receiver.get("input"), power=prev_receiver.get("power"))
+        except Exception as e:
+            log.info("handback failed: %s", e)
+        health["handed_back"] = True
+        prev_receiver.clear()
+
+
+prev_receiver = {}
+
+
 def receiver_status():
     """(power, input) from the YNC API, or (None, None)."""
     try:
@@ -633,8 +779,8 @@ def buffer_tuner():
             if b is None:
                 continue
             tune["last"] = round(b, 2)
-            if b > BUF_TARGET + 0.06:
-                tune["drain_left"] = b - BUF_TARGET
+            if b > BUF["target"] + 0.06:
+                tune["drain_left"] = b - BUF["target"]
                 log.info("receiver buffer %.2fs -> trimming %.2fs of silence", b,
                          tune["drain_left"])
                 next_check = time.time() + 20
@@ -701,6 +847,9 @@ def ensure_playing():
             return
         log.info("receiver state=%s uri=%s -> starting stream", state, uri)
         pw, inp = receiver_status()
+        if (pw != "On" or inp != "PC") and pw is not None:
+            prev_receiver.update(power=pw, input=inp, saved=True)
+            log.info("taking over receiver (was power=%s input=%s)", pw, inp)
         try:  # the RX-V671 renderer only accepts Play while on its "PC" (DLNA) input
             if pw != "On":
                 power_on()
@@ -744,6 +893,47 @@ def set_volume(spotify_vol):
 
 
 # ---------------- HTTP ----------------
+def now_playing():
+    for x in slots.slots:
+        if x.playing:
+            try:
+                out = subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{x.port}",
+                                      "--json", "now"], capture_output=True, text=True,
+                                     timeout=4).stdout
+                ev = json.loads(out)
+                item = ev.get("item", {})
+                dec = item.get("decorations", {})
+                name = dec.get("identity", {}).get("name")
+                covers = dec.get("visual_identity", {}).get("cover", [])
+                art = next((c["url"] for c in covers if c.get("size") == "default"),
+                           covers[0]["url"] if covers else None)
+                artists = [a.get("decorations", {}).get("identity", {}).get("name")
+                           for a in item.get("artists", []) if isinstance(a, dict)]
+                return {"title": name, "artists": [a for a in artists if a],
+                        "art": art, "uri": item.get("uri")}
+            except Exception:
+                return {}
+    return None
+
+
+def api_status():
+    pw, inp = receiver_status()
+    return {
+        "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"]},
+        "playing": any(x.playing for x in slots.slots),
+        "now_playing": now_playing(),
+        "accounts": sum(1 for x in slots.slots if x.paired),
+        "add_me_visible_s": slots.add_window_left(),
+        "devices": {"registered": devices.reg, "ignored": devices.ignored,
+                    "unknown": devices.unknown},
+        "latency": {"receiver_buffer_s": tune["last"], "target_s": BUF["target"],
+                    "pi_queue_ms": pi_buffer_ms()},
+        "health": {k: health[k] for k in ("stalls", "reconnects", "last_stall",
+                                          "soloist_days_left", "started")},
+        "stream_url": STREAM_URL,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
@@ -755,6 +945,46 @@ class Handler(BaseHTTPRequestHandler):
         "/stream.l16": ("audio/L16;rate=44100;channels=2", "DLNA.ORG_PN=LPCM"),
         "/stream.wav": ("audio/wav", ""),
     }
+
+    def api(self, p):
+        qs = urllib.parse.parse_qs(p.query)
+        arg = lambda k: (qs.get(k) or [""])[0]
+        code, out = 200, None
+        try:
+            if p.path == "/api/status":
+                out = api_status()
+            elif p.path == "/api/add":
+                slots.open_add_window(); out = {"ok": True}
+            elif p.path == "/api/ignore":
+                devices.ignore(arg("mac")); out = {"ok": True}
+            elif p.path == "/api/forget":
+                devices.forget(arg("mac")); out = {"ok": True}
+            elif p.path == "/api/receiver/power":
+                v = "On" if arg("on") in ("1", "true", "on") else "Standby"
+                ync(f'<YAMAHA_AV cmd="PUT"><Main_Zone><Power_Control><Power>{v}'
+                    '</Power></Power_Control></Main_Zone></YAMAHA_AV>'); out = {"ok": True}
+            elif p.path == "/api/receiver/input":
+                v = html.escape(arg("input"))
+                ync(f'<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>{v}</Input_Sel>'
+                    '</Input></Main_Zone></YAMAHA_AV>'); out = {"ok": True}
+            elif p.path == "/api/control":
+                cmd = arg("cmd")
+                if cmd not in ("pause", "play", "next", "prev"):
+                    raise ValueError("bad cmd")
+                for x in slots.slots:
+                    if x.is_active():
+                        x.ctl(cmd)
+                out = {"ok": True}
+            else:
+                code, out = 404, {"error": "not found"}
+        except Exception as e:
+            code, out = 500, {"error": str(e)}
+        body = json.dumps(out).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_HEAD(self):
         path = urllib.parse.urlparse(self.path).path
@@ -787,6 +1017,8 @@ class Handler(BaseHTTPRequestHandler):
             if p.path == "/stream.wav":
                 src = wav_hub
                 tune.update(t0=time.time(), drained=0.0, drain_left=0.0)
+                health["reconnects"] += 1
+                event("connect", ip=self.client_address[0])
             c = src.add()
             q, ev = c
             log.info("client connected %s (%d total)", self.client_address[0], hub.count())
@@ -855,6 +1087,8 @@ code{{color:#ddd}}</style>
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(body)
+        elif p.path.startswith("/api/"):
+            self.api(p)
         elif p.path == "/status":
             body = (f"clients mp3={hub.count()} l16={pcm_hub.count()} "
                     f"wav={wav_hub.count()} url={STREAM_URL} "
@@ -879,6 +1113,16 @@ def main():
     start_pipeline()
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=buffer_tuner, daemon=True).start()
+    threading.Thread(target=health_monitor, daemon=True).start()
+    threading.Thread(target=idle_handback, daemon=True).start()
+    try:
+        up = float(open("/proc/uptime").read().split()[0])
+        if up < 600:
+            alert("pi-reboot", f"Pi rebooted {int(up // 60)} min ago; speaker is back online",
+                  every=0)
+    except OSError:
+        pass
+    event("start")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
