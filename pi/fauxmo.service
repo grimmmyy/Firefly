@@ -1,0 +1,23 @@
+[Unit]
+Description=Fauxmo — Alexa (WeMo) shim for Firefly spotcast
+After=network-online.target spotcast.service
+Wants=network-online.target
+Requires=spotcast.service
+
+[Service]
+Type=simple
+User=spotcast
+Group=spotcast
+ExecStart=/opt/spotcast-venv/bin/fauxmo -c /etc/spotcast/fauxmo.json
+Restart=on-failure
+RestartSec=5
+# fauxmo opens ports 12340+ and binds to the SSDP multicast group.
+# It needs no privileges beyond that.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/spotcast-user
+
+[Install]
+WantedBy=multi-user.target
