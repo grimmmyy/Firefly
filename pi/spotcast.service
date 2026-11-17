@@ -1,13 +1,16 @@
 [Unit]
-Description=spotcast - Spotify Connect to Yamaha RX-V671 over UPnP
+Description=spotcast - Spotify (Soloist) to Yamaha RX-V671 over UPnP
 Wants=network-online.target
-After=network-online.target
+After=network-online.target user@997.service
 
 [Service]
+User=spotcast
+EnvironmentFile=/etc/spotcast/soloist.env
+Environment=XDG_RUNTIME_DIR=/run/user/997
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/spotcast/spotcast.py
 Restart=always
 RestartSec=5
-Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

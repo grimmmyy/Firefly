@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refresh Spotify Soloist (builds expire after 90 days); restart spotcast if it changed.
+# Installed at /usr/local/sbin/soloist-update, run weekly by soloist-update.timer.
+set -e
+T=$(mktemp -d); trap "rm -rf $T" EXIT
+curl -fsSL -o $T/s.tgz https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz
+tar -xzf $T/s.tgz -C $T
+NEW=$($T/soloist --version); OLD=$(/usr/local/bin/soloist --version 2>/dev/null || true)
+if [ "$NEW" != "$OLD" ]; then install -m 755 $T/soloist /usr/local/bin/soloist; systemctl restart spotcast; echo "updated: $NEW"; else echo "current: $OLD"; fi

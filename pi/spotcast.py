@@ -79,12 +79,44 @@ def start_pipeline():
          "-c:a", "libmp3lame", "-b:a", BITRATE, "-f", "mp3", "-flush_packets", "1", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
 
+    # Soloist (Spotify's official Connect player) plays into a PipeWire null
+    # sink; we capture that sink's monitor as raw PCM.
+    sh = lambda c: subprocess.run(c, shell=True, capture_output=True, text=True).stdout
+    for _ in range(30):
+        if "Server Name" in sh("pactl info"):
+            break
+        time.sleep(1)
+    if "spotcast_sink" not in sh("pactl list short sinks"):
+        sh("pactl load-module module-null-sink sink_name=spotcast_sink "
+           "rate=44100 channels=2 sink_properties=device.description=spotcast")
+    sh("pactl set-default-sink spotcast_sink")
+    sh("pactl set-sink-volume spotcast_sink 100%")
+
+    data_dir = "/var/lib/spotcast-user/soloist"
+    os.makedirs(data_dir, exist_ok=True)
+    sol = subprocess.Popen(
+        ["soloist", "--device-name", NAME, "--api-key", os.environ["SOLOIST_API_KEY"],
+         "--data-dir", data_dir, "--ws", "127.0.0.1:9090", "--initial-volume", "100"])
+    threading.Thread(target=lambda: (sol.wait(), log.error("soloist exited %s", sol.returncode),
+                                     os._exit(1)), daemon=True).start()
+
     ls = subprocess.Popen(
-        ["librespot", "--name", NAME, "--backend", "pipe", "--bitrate", "320",
-         "--device-type", "avr", "--initial-volume", "40", "--volume-ctrl", "fixed",
-         "--onevent", "/opt/spotcast/onevent.sh", "--disable-audio-cache",
-         "--system-cache", "/var/lib/spotcast"],
+        ["parec", "-d", "spotcast_sink.monitor", "--format=s16le", "--rate=44100",
+         "--channels=2", "--raw", "--latency-msec=50"],
         stdout=subprocess.PIPE, bufsize=0)
+
+    def watch_events():
+        time.sleep(5)
+        while True:
+            tr = subprocess.Popen(["soloist", "ctl", "--ws", "127.0.0.1:9090", "trace"],
+                                  stdout=subprocess.PIPE, text=True)
+            for line in tr.stdout:
+                l = line.lower()
+                if ('"playing"' in l or '"is_playing":true' in l.replace(" ", "")
+                        or "track_changed" in l):
+                    threading.Thread(target=ensure_playing, daemon=True).start()
+            time.sleep(3)
+    threading.Thread(target=watch_events, daemon=True).start()
 
     buf = bytearray()
     buf_lock = threading.Lock()
@@ -93,7 +125,7 @@ def start_pipeline():
         while True:
             d = ls.stdout.read(CHUNK)
             if not d:
-                log.error("librespot exited")
+                log.error("parec exited")
                 os._exit(1)
             with buf_lock:
                 buf.extend(d)
