@@ -167,6 +167,23 @@ class Slot:
     def paired(self):
         return os.path.exists(f"{self.dir}/paired")
 
+    def account(self):
+        """Spotify account id this slot is logged in as (stored at claim time,
+        else the most recently used <id>-user dir Soloist keeps)."""
+        try:
+            a = open(f"{self.dir}/paired").read().strip()
+            if a:
+                return a
+        except OSError:
+            pass
+        users = f"{self.dir}/settings/Users"
+        try:
+            ds = [d for d in os.listdir(users) if d.endswith("-user")]
+            ds.sort(key=lambda d: os.path.getmtime(f"{users}/{d}"), reverse=True)
+            return ds[0][:-5] if ds else ""
+        except OSError:
+            return ""
+
     def name(self):
         return NAME if self.paired else SPARE_NAME
 
@@ -222,8 +239,13 @@ class Slot:
                     continue
                 t = ev.get("type")
                 if t == "auth_state" and ev.get("logged_in") and not self.paired:
+                    time.sleep(2)                       # let Soloist write its user dir
                     open(f"{self.dir}/paired", "w").close()
-                    log.info("slot %d claimed by a new account", self.n)
+                    acct = self.account()
+                    with open(f"{self.dir}/paired", "w") as f:
+                        f.write(acct)
+                    log.info("slot %d claimed by account %s", self.n, acct[:6] + "...")
+                    self.mgr.drop_duplicates(self, acct)
                     self.mgr.add_until = 0
                     self.mgr.ensure_spare()
                     self.pending_rename = True
@@ -294,6 +316,15 @@ class SlotManager:
                 self._spawn(n)
             else:
                 shutil.rmtree(f"{SLOT_ROOT}/{n}", ignore_errors=True)
+        seen = {}
+        for sl in sorted(self.slots, key=lambda x: os.path.getmtime(f"{x.dir}/paired"),
+                         reverse=True):
+            a = sl.account()
+            if a and a in seen:
+                log.info("startup: slot %d duplicates slot %d; removing", sl.n, seen[a])
+                self.retire(sl)
+            elif a:
+                seen[a] = sl.n
         if not self.slots:          # brand-new install: let the first person in
             self.add_until = time.time() + ADD_WINDOW
         self.ensure_spare()
@@ -316,6 +347,26 @@ class SlotManager:
                 return
             n = max([s.n for s in self.slots], default=-1) + 1
             self._spawn(n)
+
+    def retire(self, sl):
+        sl.retired = True
+        if sl in self.slots:
+            self.slots.remove(sl)
+        if sl.proc and sl.proc.poll() is None:
+            sl.proc.terminate()
+        else:
+            shutil.rmtree(sl.dir, ignore_errors=True)
+
+    def drop_duplicates(self, keep, acct):
+        """One slot per Spotify account: a fresh login replaces the old slot."""
+        if not acct:
+            return
+        with self.lock:
+            for sl in [x for x in self.slots if x is not keep and x.paired]:
+                if sl.account() == acct:
+                    log.info("account %s re-linked; removing its old slot %d",
+                             acct[:6] + "...", sl.n)
+                    self.retire(sl)
 
     def took_over(self, slot):
         log.info("slot %d started playing; pausing others", slot.n)
