@@ -9,7 +9,7 @@ Pipeline:
 librespot --onevent posts player events to /event; on "playing" we make sure
 the receiver is powered on and playing our stream.
 """
-import os, sys, time, threading, subprocess, socket, html, logging
+import os, sys, time, struct, threading, subprocess, socket, html, logging
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -23,7 +23,12 @@ BITRATE = os.environ.get("SPOTCAST_BITRATE", "320k")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("spotcast")
 
-CHUNK = 4410 * 4            # 100 ms of s16le stereo @ 44.1k
+CHUNK_MS = int(os.environ.get("SPOTCAST_CHUNK_MS", "20"))
+CHUNK = 44100 * 4 * CHUNK_MS // 1000   # s16le stereo @ 44.1k
+# Output format the receiver pulls. Uncompressed LPCM moves ~4.4x more bytes per
+# second than 320k MP3, so the receiver's fixed-size buffer holds far less time
+# -> much lower latency. "wav" (RX-V671 accepts it), "l16" (RX-V671 rejects), "mp3".
+FORMAT = os.environ.get("SPOTCAST_FORMAT", "wav")
 SILENCE = b"\x00" * CHUNK
 
 
@@ -61,7 +66,7 @@ class Hub:
     def publish(self, data):
         with self.lock:
             for q, ev in self.clients:
-                if len(q) < 400:      # drop if a client is hopelessly behind
+                if len(q) < 2000:     # drop if a client is hopelessly behind
                     q.append(data)
                 ev.set()
 
@@ -70,7 +75,9 @@ class Hub:
             return len(self.clients)
 
 
-hub = Hub()
+hub = Hub()        # mp3
+pcm_hub = Hub()    # raw big-endian PCM (L16)
+wav_hub = Hub()    # little-endian PCM (WAV body)
 
 
 def start_pipeline():
@@ -96,7 +103,7 @@ def start_pipeline():
 
     ls = subprocess.Popen(
         ["parec", "-d", "spotcast_sink.monitor", "--format=s16le", "--rate=44100",
-         "--channels=2", "--raw", "--latency-msec=50"],
+         "--channels=2", "--raw", f"--latency-msec={CHUNK_MS}"],
         stdout=subprocess.PIPE, bufsize=0)
 
     buf = bytearray()
@@ -123,14 +130,24 @@ def start_pipeline():
                     extra = len(buf) > CHUNK * 20
                 else:
                     out = SILENCE; extra = False
-            try:
-                ff.stdin.write(out)
-            except BrokenPipeError:
-                os._exit(1)
+            if pcm_hub.count():
+                be = bytearray(out)
+                be[0::2], be[1::2] = out[1::2], out[0::2]   # s16le -> s16be (L16)
+                pcm_hub.publish(bytes(be))
+            if wav_hub.count():
+                wav_hub.publish(out)
+            if hub.count():
+                try:
+                    ff.stdin.write(out)
+                except BrokenPipeError:
+                    os._exit(1)
             if extra:
                 continue
-            nxt += 0.1
-            time.sleep(max(0, nxt - time.monotonic()))
+            nxt += CHUNK_MS / 1000
+            delay = nxt - time.monotonic()
+            if delay < -0.5:          # fell behind (e.g. CPU stall): resync clock
+                nxt = time.monotonic()
+            time.sleep(max(0, delay))
 
     def read_ffmpeg():
         while True:
@@ -534,6 +551,38 @@ def power_on():
         log.info("power on (YNC) failed: %s", e)
 
 
+def receiver_status():
+    """(power, input) from the YNC API, or (None, None)."""
+    try:
+        r = ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
+                '</Basic_Status></Main_Zone></YAMAHA_AV>')
+        pw = r.split("<Power>")[1].split("<")[0] if "<Power>" in r else None
+        inp = r.split("<Input_Sel>")[1].split("<")[0] if "<Input_Sel>" in r else None
+        return pw, inp
+    except Exception:
+        return None, None
+
+
+def watchdog():
+    """While Spotify is playing on any slot, keep the receiver on our stream.
+    Leaves it alone if someone deliberately switched to another input."""
+    while True:
+        time.sleep(8)
+        try:
+            if not any(x.playing for x in slots.slots):
+                continue
+            state, uri = transport_state()
+            if state == "PLAYING" and uri == STREAM_URL:
+                continue
+            pw, inp = receiver_status()
+            if pw == "On" and inp not in (None, "PC"):
+                continue                     # user picked another source
+            log.info("watchdog: receiver %s/%s on %s; restoring stream", pw, inp, state)
+            ensure_playing()
+        except Exception as e:
+            log.info("watchdog error: %s", e)
+
+
 def transport_state():
     try:
         r = soap("AVTransport", "GetTransportInfo", [("InstanceID", 0)])
@@ -555,13 +604,17 @@ def ensure_playing():
         if state == "PLAYING" and uri == STREAM_URL:
             return
         log.info("receiver state=%s uri=%s -> starting stream", state, uri)
-        power_on()
+        pw, inp = receiver_status()
         try:  # the RX-V671 renderer only accepts Play while on its "PC" (DLNA) input
-            ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>PC</Input_Sel>'
-                '</Input></Main_Zone></YAMAHA_AV>')
-            time.sleep(3)
+            if pw != "On":
+                power_on()
+                time.sleep(4)            # amp boot
+            if inp != "PC":
+                ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>PC</Input_Sel>'
+                    '</Input></Main_Zone></YAMAHA_AV>')
+                time.sleep(1.5)
         except Exception as e:
-            log.info("input switch failed: %s", e)
+            log.info("power/input switch failed: %s", e)
         didl = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
                 'xmlns:dc="http://purl.org/dc/elements/1.1/" '
                 'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
@@ -601,26 +654,43 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    FORMATS = {
+        "/stream.mp3": ("audio/mpeg", "DLNA.ORG_PN=MP3"),
+        "/stream.l16": ("audio/L16;rate=44100;channels=2", "DLNA.ORG_PN=LPCM"),
+        "/stream.wav": ("audio/wav", ""),
+    }
+
     def do_HEAD(self):
-        if self.path.startswith("/stream.mp3"):
-            self._stream_headers()
+        path = urllib.parse.urlparse(self.path).path
+        if path in self.FORMATS:
+            self._stream_headers(path)
         else:
             self.send_response(404); self.end_headers()
 
-    def _stream_headers(self):
+    def _stream_headers(self, path="/stream.mp3"):
+        ctype, pn = self.FORMATS[path]
         self.send_response(200)
-        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-cache")
         self.send_header("transferMode.dlna.org", "Streaming")
-        self.send_header("contentFeatures.dlna.org",
-                         "DLNA.ORG_PN=MP3;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+        feats = "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        self.send_header("contentFeatures.dlna.org", f"{pn};{feats}" if pn else feats)
         self.end_headers()
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
-        if p.path == "/stream.mp3":
-            self._stream_headers()
-            c = hub.add()
+        if p.path in self.FORMATS:
+            self._stream_headers(p.path)
+            if p.path == "/stream.wav":
+                # streaming WAV header with max sizes (length unknown)
+                hdr = (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt " +
+                       struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) +
+                       b"data" + struct.pack("<I", 0xFFFFFFFF))
+                self.wfile.write(hdr)
+            src = hub if p.path == "/stream.mp3" else pcm_hub
+            if p.path == "/stream.wav":
+                src = wav_hub
+            c = src.add()
             q, ev = c
             log.info("client connected %s (%d total)", self.client_address[0], hub.count())
             try:
@@ -631,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
-                hub.remove(c)
+                src.remove(c)
                 log.info("client left %s", self.client_address[0])
         elif p.path == "/event":
             qs = urllib.parse.parse_qs(p.query)
@@ -689,7 +759,8 @@ code{{color:#ddd}}</style>
             self.end_headers()
             self.wfile.write(body)
         elif p.path == "/status":
-            body = f"clients={hub.count()} url={STREAM_URL}\n".encode()
+            body = (f"clients mp3={hub.count()} l16={pcm_hub.count()} "
+                    f"wav={wav_hub.count()} url={STREAM_URL}\n").encode()
             self.send_response(200); self.send_header("Content-Type", "text/plain")
             self.end_headers(); self.wfile.write(body)
         else:
@@ -700,13 +771,14 @@ def main():
     global STREAM_URL
     while True:
         try:
-            STREAM_URL = f"http://{lan_ip()}:{PORT}/stream.mp3"
+            STREAM_URL = f"http://{lan_ip()}:{PORT}/stream.{FORMAT}"
             break
         except OSError:
             time.sleep(3)
     log.info("spotcast '%s' -> %s, stream %s", NAME, RECEIVER, STREAM_URL)
     os.makedirs("/var/lib/spotcast", exist_ok=True)
     start_pipeline()
+    threading.Thread(target=watchdog, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
