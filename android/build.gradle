@@ -11,6 +11,17 @@ subprojects {
 }
 subprojects {
     project.evaluationDependsOn(":app")
+
+    // Force every plugin subproject to compile against a modern SDK so
+    // AAR metadata checks (which demand compileSdk >= the plugins' own
+    // declared requirement) pass regardless of what each plugin pins.
+    afterEvaluate { project ->
+        if (project.hasProperty("android")) {
+            project.android {
+                compileSdkVersion 36
+            }
+        }
+    }
 }
 
 tasks.register("clean", Delete) {
