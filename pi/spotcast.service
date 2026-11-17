@@ -5,6 +5,7 @@ After=network-online.target user@997.service
 
 [Service]
 User=spotcast
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 EnvironmentFile=/etc/spotcast/soloist.env
 Environment=XDG_RUNTIME_DIR=/run/user/997
 Environment=PYTHONUNBUFFERED=1
