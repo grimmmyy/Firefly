@@ -78,7 +78,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: "3.24.5"
 
       - name: Fill in missing Flutter scaffolding
         run: flutter create . --platforms=windows --org com.firefly --project-name firefly
