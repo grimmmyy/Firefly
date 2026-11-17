@@ -92,31 +92,12 @@ def start_pipeline():
     sh("pactl set-default-sink spotcast_sink")
     sh("pactl set-sink-volume spotcast_sink 100%")
 
-    data_dir = "/var/lib/spotcast-user/soloist"
-    os.makedirs(data_dir, exist_ok=True)
-    sol = subprocess.Popen(
-        ["soloist", "--device-name", NAME, "--api-key", os.environ["SOLOIST_API_KEY"],
-         "--data-dir", data_dir, "--ws", "127.0.0.1:9090", "--initial-volume", "100"])
-    threading.Thread(target=lambda: (sol.wait(), log.error("soloist exited %s", sol.returncode),
-                                     os._exit(1)), daemon=True).start()
+    slots.start()
 
     ls = subprocess.Popen(
         ["parec", "-d", "spotcast_sink.monitor", "--format=s16le", "--rate=44100",
          "--channels=2", "--raw", "--latency-msec=50"],
         stdout=subprocess.PIPE, bufsize=0)
-
-    def watch_events():
-        time.sleep(5)
-        while True:
-            tr = subprocess.Popen(["soloist", "ctl", "--ws", "127.0.0.1:9090", "trace"],
-                                  stdout=subprocess.PIPE, text=True)
-            for line in tr.stdout:
-                l = line.lower()
-                if ('"playing"' in l or '"is_playing":true' in l.replace(" ", "")
-                        or "track_changed" in l):
-                    threading.Thread(target=ensure_playing, daemon=True).start()
-            time.sleep(3)
-    threading.Thread(target=watch_events, daemon=True).start()
 
     buf = bytearray()
     buf_lock = threading.Lock()
@@ -161,6 +142,131 @@ def start_pipeline():
 
     for f in (read_librespot, pump, read_ffmpeg):
         threading.Thread(target=f, daemon=True).start()
+
+
+# ---------------- multi-account Soloist slots ----------------
+import json, shutil
+
+SPARE_NAME = os.environ.get("SPOTCAST_SPARE_NAME", "Living Room - Add me")
+MAX_SLOTS = int(os.environ.get("SPOTCAST_MAX_SLOTS", "6"))
+SLOT_ROOT = "/var/lib/spotcast-user/slots"
+
+
+class Slot:
+    """One Soloist instance = one Spotify account's view of the receiver."""
+
+    def __init__(self, mgr, n):
+        self.mgr, self.n = mgr, n
+        self.dir = f"{SLOT_ROOT}/{n}"
+        self.port = 9100 + n
+        self.proc = None
+        self.playing = False
+        os.makedirs(self.dir, exist_ok=True)
+
+    @property
+    def paired(self):
+        return os.path.exists(f"{self.dir}/paired")
+
+    def name(self):
+        return NAME if self.paired else SPARE_NAME
+
+    def ctl(self, *args):
+        subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{self.port}", *args],
+                       capture_output=True, timeout=10)
+
+    def run(self):
+        while True:
+            log.info("slot %d starting as '%s'", self.n, self.name())
+            self.proc = subprocess.Popen(
+                ["soloist", "--device-name", self.name(),
+                 "--api-key", os.environ["SOLOIST_API_KEY"], "--data-dir", self.dir,
+                 "--ws", f"127.0.0.1:{self.port}", "--initial-volume", "100"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            threading.Thread(target=self.watch, args=(self.proc,), daemon=True).start()
+            rc = self.proc.wait()
+            self.playing = False
+            if rc == 10:
+                log.error("soloist build expired; run soloist-update")
+            if getattr(self, "_restart", False):
+                self._restart = False
+                continue
+            log.info("slot %d exited rc=%s; restarting", self.n, rc)
+            time.sleep(5)
+
+    def restart(self):
+        self._restart = True
+        if self.proc:
+            self.proc.terminate()
+
+    def watch(self, proc):
+        time.sleep(3)
+        while proc.poll() is None:
+            tr = subprocess.Popen(["soloist", "ctl", "--ws", f"127.0.0.1:{self.port}", "trace"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            for line in tr.stdout:
+                try:
+                    ev = json.loads(line.split(" ", 1)[1])
+                except Exception:
+                    continue
+                t = ev.get("type")
+                if t == "auth_state" and ev.get("logged_in") and not self.paired:
+                    open(f"{self.dir}/paired", "w").close()
+                    log.info("slot %d claimed by a new account", self.n)
+                    self.mgr.ensure_spare()
+                    self.pending_rename = True
+                elif t == "playback_state":
+                    was = self.playing
+                    self.playing = ev.get("status") == "playing"
+                    if self.playing and not was:
+                        self.mgr.took_over(self)
+                    if not self.playing and getattr(self, "pending_rename", False):
+                        self.pending_rename = False
+                        self.restart()   # come back named NAME for its owner
+            tr.wait()
+            time.sleep(2)
+
+
+class SlotManager:
+    def __init__(self):
+        self.slots = []
+        self.lock = threading.Lock()
+
+    def start(self):
+        os.makedirs(SLOT_ROOT, exist_ok=True)
+        legacy = "/var/lib/spotcast-user/soloist"   # first, single-account setup
+        if os.path.isdir(legacy) and not os.path.exists(f"{SLOT_ROOT}/0"):
+            shutil.move(legacy, f"{SLOT_ROOT}/0")
+            open(f"{SLOT_ROOT}/0/paired", "w").close()
+        ns = sorted(int(d) for d in os.listdir(SLOT_ROOT) if d.isdigit())
+        for n in ns:
+            self._spawn(n)
+        self.ensure_spare()
+
+    def _spawn(self, n):
+        sl = Slot(self, n)
+        self.slots.append(sl)
+        threading.Thread(target=sl.run, daemon=True).start()
+        return sl
+
+    def ensure_spare(self):
+        with self.lock:
+            if any(not s.paired for s in self.slots):
+                return
+            if len(self.slots) >= MAX_SLOTS:
+                log.info("max slots reached; no spare")
+                return
+            n = max([s.n for s in self.slots], default=-1) + 1
+            self._spawn(n)
+
+    def took_over(self, slot):
+        log.info("slot %d started playing; pausing others", slot.n)
+        for s in self.slots:
+            if s is not slot and s.playing:
+                threading.Thread(target=s.ctl, args=("pause",), daemon=True).start()
+        threading.Thread(target=ensure_playing, daemon=True).start()
+
+
+slots = SlotManager()
 
 
 # ---------------- receiver control ----------------
