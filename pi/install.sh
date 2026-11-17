@@ -24,7 +24,7 @@ esac
 echo "==> packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  python3 ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 >/dev/null
+  python3 python3-venv ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 >/dev/null
 
 echo "==> service user"
 id spotcast >/dev/null 2>&1 || useradd -r -m -d /var/lib/spotcast-user -s /usr/sbin/nologin spotcast
@@ -63,6 +63,13 @@ umask 022
 chown spotcast /etc/spotcast/soloist.env
 chown -R spotcast /var/lib/spotcast /var/lib/spotcast-user
 
+echo "==> Alexa skill backend (optional — needs manual skill setup, see pi/alexa-skill/README.md)"
+python3 -m venv /opt/spotcast-venv
+/opt/spotcast-venv/bin/pip install --quiet --upgrade pip
+/opt/spotcast-venv/bin/pip install --quiet -r "$HERE/alexa-skill/requirements.txt"
+install -m 755 "$HERE/alexa-skill/handler.py" /opt/spotcast/alexa-handler.py
+install -m 644 "$HERE/alexa-skill.service" /etc/systemd/system/
+
 echo "==> systemd"
 sed "s/997/$UID_SC/g" "$HERE/spotcast.service" > /etc/systemd/system/spotcast.service
 install -m 644 "$HERE/soloist-update.service" /etc/systemd/system/
@@ -70,7 +77,12 @@ install -m 644 "$HERE/soloist-update.timer" /etc/systemd/system/
 systemctl daemon-reload
 sudo -u spotcast XDG_RUNTIME_DIR="/run/user/$UID_SC" systemctl --user restart pipewire pipewire-pulse wireplumber || true
 systemctl enable --now spotcast soloist-update.timer
+# alexa-skill starts only once /etc/spotcast/alexa.env has ALEXA_APP_ID set.
+# See pi/alexa-skill/README.md.
 
 echo
 echo "Done. In Spotify (on the same Wi-Fi), pick \"Living Room - Add me\" to link your account."
 echo "Status page: http://$(hostname -I | awk '{print $1}'):8090"
+echo
+echo "Voice control is optional. To enable 'Alexa, ask Firefly to play X',"
+echo "follow pi/alexa-skill/README.md (needs Spotify Premium + Cloudflare Tunnel)."

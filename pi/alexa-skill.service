@@ -1,0 +1,21 @@
+[Unit]
+Description=Firefly Alexa skill backend
+After=network-online.target spotcast.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spotcast
+Group=spotcast
+EnvironmentFile=-/etc/spotcast/alexa.env
+EnvironmentFile=/etc/spotcast/soloist.env
+ExecStart=/opt/spotcast-venv/bin/python3 /opt/spotcast/alexa-handler.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
