@@ -1,0 +1,31 @@
+name: firefly
+description: Cast local audio, podcasts, and internet radio to a Yamaha RX-V671 (or any DLNA/UPnP AV receiver).
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+  flutter: ">=3.27.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  http: ^1.2.0
+  xml: ^6.5.0
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
+  file_picker: ^8.0.0
+  path_provider: ^2.1.2
+  network_info_plus: ^5.0.3
+  shared_preferences: ^2.2.2
+  permission_handler: ^11.3.0
+  audio_session: ^0.1.18
+
+dev_dependencies:
+  flutter_launcher_icons: ^0.14.3
+  flutter_lints: ^3.0.1
+
+flutter:
+  uses-material-design: true
+

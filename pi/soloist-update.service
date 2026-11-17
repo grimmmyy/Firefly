@@ -1,0 +1,5 @@
+[Unit]
+Description=Update Spotify Soloist
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/soloist-update
