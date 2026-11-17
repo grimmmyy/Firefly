@@ -6,6 +6,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../services/cast_controller.dart';
 import '../services/ssdp.dart';
+import 'spotify_tab.dart';
 
 class HomePage extends StatefulWidget {
   final CastController controller;
@@ -36,7 +37,7 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final c = widget.controller;
     return DefaultTabController(
-      length: 3,
+      length: 4,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Firefly'),
@@ -55,6 +56,7 @@ class _HomePageState extends State<HomePage> {
           ],
           bottom: const TabBar(
             tabs: [
+              Tab(icon: Icon(Icons.queue_music), text: 'Spotify'),
               Tab(icon: Icon(Icons.speaker), text: 'Receiver'),
               Tab(icon: Icon(Icons.radio), text: 'Stations'),
               Tab(icon: Icon(Icons.folder_open), text: 'Files'),
@@ -67,6 +69,7 @@ class _HomePageState extends State<HomePage> {
             Expanded(
               child: TabBarView(
                 children: [
+                  const SpotifyTab(),
                   _ReceiverTab(controller: c),
                   _StationsTab(controller: c),
                   _FilesTab(controller: c),
