@@ -9,19 +9,23 @@ rootProject.buildDir = "../build"
 subprojects {
     project.buildDir = "${rootProject.buildDir}/${project.name}"
 }
+// Force every plugin subproject (but not :app, which sets this itself
+// and is a hard evaluation dependency) to compile against a modern SDK
+// so AAR metadata checks pass regardless of what each plugin pins.
 subprojects {
-    project.evaluationDependsOn(":app")
-
-    // Force every plugin subproject to compile against a modern SDK so
-    // AAR metadata checks (which demand compileSdk >= the plugins' own
-    // declared requirement) pass regardless of what each plugin pins.
-    afterEvaluate { project ->
-        if (project.hasProperty("android")) {
-            project.android {
-                compileSdkVersion 36
+    if (project.name != "app") {
+        afterEvaluate { project ->
+            if (project.hasProperty("android")) {
+                project.android {
+                    compileSdkVersion 36
+                }
             }
         }
     }
+}
+
+subprojects {
+    project.evaluationDependsOn(":app")
 }
 
 tasks.register("clean", Delete) {
