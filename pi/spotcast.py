@@ -170,6 +170,15 @@ class Slot:
     def name(self):
         return NAME if self.paired else SPARE_NAME
 
+    def is_active(self):
+        try:
+            out = subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{self.port}", "status"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            self.active = "active device: yes" in out
+        except Exception:
+            pass
+        return getattr(self, "active", False)
+
     def ctl(self, *args):
         subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{self.port}", *args],
                        capture_output=True, timeout=10)
@@ -218,9 +227,15 @@ class Slot:
                     self.mgr.add_until = 0
                     self.mgr.ensure_spare()
                     self.pending_rename = True
+                elif t == "auth_state":
+                    self.active = bool(ev.get("is_active"))
+                    if not self.active:
+                        self.playing = False
                 elif t == "playback_state":
+                    # Every device on an account sees that account's playback;
+                    # only count it when THIS device is the active output.
                     was = self.playing
-                    self.playing = ev.get("status") == "playing"
+                    self.playing = (ev.get("status") == "playing") and self.is_active()
                     if self.playing and not was:
                         self.mgr.took_over(self)
                     if not self.playing and getattr(self, "pending_rename", False):
@@ -305,7 +320,10 @@ class SlotManager:
     def took_over(self, slot):
         log.info("slot %d started playing; pausing others", slot.n)
         for s in self.slots:
-            if s is not slot and s.playing:
+            # Only pause a slot that is still the active output for its account;
+            # pausing an inactive slot would pause that account on other devices.
+            if s is not slot and s.playing and s.is_active():
+                s.playing = False
                 threading.Thread(target=s.ctl, args=("pause",), daemon=True).start()
         threading.Thread(target=ensure_playing, daemon=True).start()
 
