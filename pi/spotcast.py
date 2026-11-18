@@ -443,6 +443,9 @@ class Slot:
                     if not self.active:
                         self.playing = False
                 elif t == "playback_state":
+                    uri = (ev.get("item") or {}).get("uri")
+                    if ev.get("status") == "playing" and ev.get("is_active") is False:
+                        follow.remote_play(self, uri)
                     # Every device on an account sees that account's playback;
                     # only count it when THIS device is the active output.
                     was = self.playing
@@ -775,6 +778,7 @@ def idle_handback():
             log.info("handback failed: %s", e)
         health["handed_back"] = True
         prev_receiver.clear()
+        follow.off("idle")
 
 
 prev_receiver = {}
@@ -839,6 +843,7 @@ def sleep_watch():
         if u and time.time() >= u:
             sleep_timer["until"] = None
             log.info("sleep timer: pausing and handing receiver back")
+            follow.off("sleep timer")
             hand_back_now()
             prev_receiver.update(power="Standby", saved=True)   # sleep => standby
             health["last_playing"] = 0
@@ -1052,6 +1057,70 @@ def keep_echo_connected():
             log.info("keep_echo_connected error: %s", e)
 
 
+class Follow:
+    """'Alexa, play X' -> receiver, for any linked Spotify account.
+
+    Alexa plays Spotify on the Echo under the speaker's own account. Every
+    linked account has a Soloist slot here that sees that playback, and
+    `soloist ctl activate` moves it to the receiver (a Spotify Connect hand-off).
+
+      arm()   - 'Alexa, turn on the receiver': for ARM_S seconds, the first
+                account that starts playing elsewhere becomes the owner.
+      owner   - its *new* requests (track changes elsewhere) keep following;
+                moving the same track to headphones is left alone.
+      off()   - 'turn off the receiver', idle hand-back, or sleep timer.
+    """
+    ARM_S = 90
+
+    def __init__(self):
+        self.armed_until = 0.0
+        self.owner = None          # account id
+        self.last_grab = {}        # account -> uri we last pulled
+        self.lock = threading.Lock()
+
+    @property
+    def enabled(self):
+        return self.owner is not None or time.time() < self.armed_until
+
+    def arm(self):
+        self.armed_until = time.time() + self.ARM_S
+        log.info("follow: armed for %ds", self.ARM_S)
+        event("follow-armed")
+
+    def off(self, why=""):
+        if self.enabled:
+            log.info("follow: off %s", why)
+            event("follow-off", why=why)
+        self.armed_until, self.owner = 0.0, None
+
+    def remote_play(self, slot, uri):
+        acct = slot.account()
+        with self.lock:
+            if not acct or not uri:
+                return
+            if self.owner is None:
+                if time.time() >= self.armed_until:
+                    return
+            elif acct != self.owner:
+                return                            # someone else's own listening
+            if self.last_grab.get(acct) == uri:
+                return                            # same track moved away on purpose
+            self.last_grab[acct] = uri
+            self.owner, self.armed_until = acct, 0.0
+        log.info("follow: pulling %s's playback to the receiver (slot %d)",
+                 acct[:6] + "...", slot.n)
+        event("follow-grab", slot=slot.n)
+        threading.Thread(target=slot.ctl, args=("activate",), daemon=True).start()
+
+    def status(self):
+        return {"enabled": self.enabled,
+                "armed_s": max(0, int(self.armed_until - time.time())),
+                "owner": (self.owner or "")[:6] or None}
+
+
+follow = Follow()
+
+
 def bt_pair_window(secs=120):
     sh_out(["bluetoothctl", "pairable", "on"])
     sh_out(["bluetoothctl", "discoverable", "on"])
@@ -1262,6 +1331,7 @@ def api_status():
         "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"],
                      "volume_db": vol, "mute": mute, "max_db": MAX_DB},
         "queue": queue(),
+        "follow": follow.status(),
         "source": ("bluetooth" if health.get("bt_streaming") else
                    "spotify" if any(x.playing for x in slots.slots) else
                    "audio" if time.time() - activity["last_sound"] < 2 else None),
@@ -1336,6 +1406,12 @@ class Handler(BaseHTTPRequestHandler):
                 bt_pair_window(); out = {"ok": True}
             elif p.path == "/api/bt/forget":
                 sh_out(["bluetoothctl", "remove", arg("mac")]); out = {"ok": True}
+            elif p.path == "/api/follow":
+                if arg("on") in ("1", "true", "on"):
+                    follow.arm()
+                else:
+                    follow.off("api")
+                out = follow.status()
             elif p.path == "/api/handback":
                 hand_back_now(); out = {"ok": True}
             elif p.path == "/api/update":

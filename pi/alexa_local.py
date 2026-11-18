@@ -66,6 +66,8 @@ def receiver_get():
 def receiver_set(on=None, bri=None):
     if on is not None:
         api("receiver/power", on="1" if on else "0")
+        # on = arm follow mode ("Alexa, play X" then moves to the receiver)
+        api("follow", on="1" if on else "0")
     if bri is not None:
         mx = status().get("receiver", {}).get("max_db", -10)
         db = -80.5 + (bri / 254) * (mx + 80.5)
