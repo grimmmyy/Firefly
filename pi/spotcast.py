@@ -106,6 +106,9 @@ def pi_buffer_ms():
     return round(sum(xs) / len(xs) / (44100 * 4) * 1000) if xs else 0
 
 
+activity = {"last_sound": 0.0}
+
+
 def is_silent(pcm, threshold=48):
     """True if every s16le sample in this chunk is near zero."""
     a = memoryview(pcm).cast("h")
@@ -157,6 +160,8 @@ def start_pipeline():
             with buf_lock:
                 if len(buf) >= CHUNK:
                     out = bytes(buf[:CHUNK]); del buf[:CHUNK]
+                    if not is_silent(out):
+                        activity["last_sound"] = time.time()
                     # if librespot got far ahead (it decodes faster than real time
                     # only briefly), drain faster to avoid growing latency
                     extra = len(buf) > CHUNK * PI_JITTER_CHUNKS
@@ -557,6 +562,8 @@ class SlotManager:
 
     def took_over(self, slot):
         log.info("slot %d started playing; pausing others", slot.n)
+        if health.get("bt_streaming"):
+            threading.Thread(target=bt_pause, daemon=True).start()
         for s in self.slots:
             # Only pause a slot that is still the active output for its account;
             # pausing an inactive slot would pause that account on other devices.
@@ -570,6 +577,26 @@ slots = SlotManager()
 
 
 # ---------------- receiver control ----------------
+# The RX-V671's embedded web server hangs if it gets parallel or rapid-fire
+# requests. Every call to it goes through this gate: one at a time, with a
+# minimum gap between requests.
+RX_GATE = threading.Lock()
+RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.12"))
+_rx_last = [0.0]
+
+
+def rx_request(req, timeout=5):
+    with RX_GATE:
+        wait = RX_MIN_GAP - (time.monotonic() - _rx_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8", "replace")
+        finally:
+            _rx_last[0] = time.monotonic()
+
+
 def soap(service, action, args):
     body = "".join(f"<{k}>{v}</{k}>" for k, v in args)
     env = ('<?xml version="1.0" encoding="utf-8"?>'
@@ -581,19 +608,18 @@ def soap(service, action, args):
         f"http://{RECEIVER}:{RECEIVER_UPNP}/{service}/ctrl", data=env, method="POST",
         headers={"Content-Type": 'text/xml; charset="utf-8"',
                  "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"'})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return r.read().decode("utf-8", "replace")
+    return rx_request(req)
 
 
 def ync(xml):
     req = urllib.request.Request(f"http://{RECEIVER}/YamahaRemoteControl/ctrl",
                                  data=xml.encode(), method="POST",
                                  headers={"Content-Type": "text/xml"})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return r.read().decode("utf-8", "replace")
+    return rx_request(req)
 
 
 def power_on():
+    invalidate_basic()
     try:
         ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Power_Control><Power>On</Power>'
             '</Power_Control></Main_Zone></YAMAHA_AV>')
@@ -645,6 +671,28 @@ def alert(key, text, every=6 * 3600):
     threading.Thread(target=send, daemon=True).start()
 
 
+PREV_INPUT_FILE = "/var/lib/spotcast-user/previous_input"
+
+
+def remember_input(inp):
+    try:
+        if open(PREV_INPUT_FILE).read().strip() == inp:
+            return
+    except OSError:
+        pass
+    try:
+        open(PREV_INPUT_FILE, "w").write(inp)
+    except OSError:
+        pass
+
+
+def previous_input():
+    try:
+        return open(PREV_INPUT_FILE).read().strip() or None
+    except OSError:
+        return None
+
+
 def health_monitor():
     """Receiver reachability, Soloist build expiry, playback stalls."""
     last_pos, last_pos_t = None, time.time()
@@ -652,6 +700,8 @@ def health_monitor():
         time.sleep(15)
         # receiver reachable?
         pw, inp = receiver_status()
+        if pw == "On" and inp and inp != "PC":
+            remember_input(inp)
         if pw is None:
             if health["receiver_fail_since"] is None:
                 health["receiver_fail_since"] = time.time()
@@ -697,7 +747,7 @@ def idle_handback():
     restore the input it was on (or standby if we woke it)."""
     while True:
         time.sleep(30)
-        if any(x.playing for x in slots.slots):
+        if any(x.playing for x in slots.slots) or time.time() - activity["last_sound"] < 30:
             health["last_playing"], health["handed_back"] = time.time(), False
             continue
         if health["handed_back"] or not prev_receiver.get("saved"):
@@ -730,10 +780,31 @@ def idle_handback():
 prev_receiver = {}
 
 
+_basic = {"t": 0.0, "xml": None}
+
+
+def basic_status(max_age=2.0):
+    """Main_Zone Basic_Status, shared by everything for max_age seconds."""
+    if time.time() - _basic["t"] < max_age and _basic["xml"] is not None:
+        return _basic["xml"]
+    try:
+        _basic["xml"] = ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
+                            '</Basic_Status></Main_Zone></YAMAHA_AV>')
+    except Exception:
+        _basic["xml"] = None
+    _basic["t"] = time.time()
+    return _basic["xml"]
+
+
+def invalidate_basic():
+    _basic["t"] = 0.0
+
+
 def receiver_volume():
     try:
-        r = ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
-                '</Basic_Status></Main_Zone></YAMAHA_AV>')
+        r = basic_status()
+        if r is None:
+            return None, None
         m = re.search(r"<Volume><Lvl><Val>(-?\d+)</Val>", r)
         mute = re.search(r"<Mute>(\w+)</Mute>", r)
         return (int(m.group(1)) / 10 if m else None,
@@ -743,6 +814,7 @@ def receiver_volume():
 
 
 def set_receiver_volume(db):
+    invalidate_basic()
     db = max(-80.5, min(MAX_DB, round(float(db) * 2) / 2))   # 0.5 dB steps
     ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Volume><Lvl><Val>%d</Val><Exp>1</Exp>'
         '<Unit>dB</Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>' % int(db * 10))
@@ -794,11 +866,131 @@ def queue(n=5):
     return []
 
 
+def sh_out(cmd, timeout=6):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def bt_devices():
+    """Paired Bluetooth devices: [{mac, name, connected, trusted}]."""
+    out = []
+    for line in sh_out(["bluetoothctl", "devices", "Paired"]).splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) < 3:
+            continue
+        mac, name = parts[1], parts[2]
+        info = sh_out(["bluetoothctl", "info", mac])
+        out.append({"mac": mac, "name": name,
+                    "connected": "Connected: yes" in info,
+                    "trusted": "Trusted: yes" in info})
+    return out
+
+
+def bt_streaming():
+    """True if a Bluetooth phone/Echo is feeding audio into PipeWire right now."""
+    out = sh_out(["pactl", "list", "sink-inputs"])
+    for block in out.split("Sink Input #")[1:]:
+        if "bluez" in block and "Corked: no" in block:
+            return True
+    return False
+
+
+def bt_pause():
+    # AVRCP pause to whatever is streaming over Bluetooth (best effort)
+    for d in bt_devices():
+        if d["connected"]:
+            sh_out(["bluetoothctl", "player.pause"])
+            return
+
+
+def bt_watch():
+    """Trust newly paired devices; arbitrate Spotify vs Bluetooth (newest wins);
+    wake the receiver when any source starts making sound."""
+    was_bt = False
+    BT_STATE = "/var/lib/spotcast-user/bt_connected.json"
+    # after a reboot / restart: reconnect devices that were connected before
+    try:
+        wanted = json.load(open(BT_STATE))
+    except Exception:
+        wanted = []
+    if wanted:
+        def reconnect():
+            for attempt in range(6):
+                time.sleep(10)
+                missing = [m for m in wanted
+                           if "Connected: yes" not in sh_out(["bluetoothctl", "info", m])]
+                if not missing:
+                    log.info("bluetooth: reconnected %s", ", ".join(wanted))
+                    return
+                for m in missing:
+                    sh_out(["bluetoothctl", "connect", m], timeout=20)
+            log.info("bluetooth: could not reconnect %s", ", ".join(wanted))
+        threading.Thread(target=reconnect, daemon=True).start()
+    last_saved = None
+    while True:
+        time.sleep(1)
+        try:
+            # remember which devices are connected (so a reboot restores them)
+            if int(time.time()) % 10 == 0:
+                conn = sorted(d["mac"] for d in bt_devices() if d["connected"])
+                if conn != last_saved and (conn or last_saved is not None):
+                    try:
+                        json.dump(conn, open(BT_STATE, "w"))
+                    except OSError:
+                        pass
+                    last_saved = conn
+            # trust paired devices so they can reconnect without pairing again
+            if int(time.time()) % 15 == 0:
+                for d in bt_devices():
+                    if not d["trusted"]:
+                        sh_out(["bluetoothctl", "trust", d["mac"]])
+                        log.info("bluetooth: trusted %s (%s)", d["name"], d["mac"])
+                        event("bt-paired", name=d["name"])
+            now_bt = bt_streaming()
+            if now_bt and not was_bt:
+                log.info("bluetooth audio started; pausing Spotify slots")
+                event("bt-start")
+                for x in slots.slots:
+                    if x.playing and x.is_active():
+                        x.ctl("pause"); x.playing = False
+            was_bt = now_bt
+            health["bt_streaming"] = now_bt
+            # any source producing sound -> make sure the receiver plays our stream
+            if time.time() - activity["last_sound"] < 1.0:
+                health["last_playing"], health["handed_back"] = time.time(), False
+                if not stream_live():
+                    threading.Thread(target=ensure_playing, daemon=True).start()
+                    time.sleep(3)
+        except Exception as e:
+            log.info("bt_watch error: %s", e)
+
+
+_live_cache = {"t": 0.0, "v": False}
+
+
+def stream_live():
+    if time.time() - _live_cache["t"] < 5:
+        return _live_cache["v"]
+    st, uri = transport_state()
+    _live_cache.update(t=time.time(), v=(st == "PLAYING" and uri == STREAM_URL))
+    return _live_cache["v"]
+
+
+def bt_pair_window(secs=120):
+    sh_out(["bluetoothctl", "pairable", "on"])
+    sh_out(["bluetoothctl", "discoverable", "on"])
+    log.info("bluetooth pairing open for %ds", secs)
+    event("bt-pair-open")
+
+
 def receiver_status():
     """(power, input) from the YNC API, or (None, None)."""
     try:
-        r = ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
-                '</Basic_Status></Main_Zone></YAMAHA_AV>')
+        r = basic_status()
+        if r is None:
+            return None, None
         pw = r.split("<Power>")[1].split("<")[0] if "<Power>" in r else None
         inp = r.split("<Input_Sel>")[1].split("<")[0] if "<Input_Sel>" in r else None
         return pw, inp
@@ -827,9 +1019,11 @@ def measure_buffer(seconds=7):
         if rt is not None and last is not None and rt > last:
             ests.append((time.time() - t0 - tune["drained"]) - rt)
         last = rt
-        time.sleep(0.03)
+        time.sleep(0.2)                  # gentle on the receiver (was 30 ms)
     ests = ests[1:] or ests
-    return sorted(ests)[len(ests) // 2] if ests else None
+    # each tick is detected up to one poll interval late, which only ever
+    # inflates the estimate, so the smallest sample is the most accurate
+    return min(ests) if ests else None
 
 
 def buffer_tuner():
@@ -917,6 +1111,8 @@ def ensure_playing():
         pw, inp = receiver_status()
         if (pw != "On" or inp != "PC") and pw is not None:
             prev_receiver.update(power=pw, input=inp, saved=True)
+            if inp and inp != "PC":
+                remember_input(inp)
             log.info("taking over receiver (was power=%s input=%s)", pw, inp)
         try:  # the RX-V671 renderer only accepts Play while on its "PC" (DLNA) input
             if pw != "On":
@@ -992,9 +1188,16 @@ def api_status():
         "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"],
                      "volume_db": vol, "mute": mute, "max_db": MAX_DB},
         "queue": queue(),
+        "source": ("bluetooth" if health.get("bt_streaming") else
+                   "spotify" if any(x.playing for x in slots.slots) else
+                   "audio" if time.time() - activity["last_sound"] < 2 else None),
+        "bluetooth": {"devices": bt_devices(),
+                      "discoverable": "Discoverable: yes" in sh_out(["bluetoothctl", "show"]),
+                      "streaming": bool(health.get("bt_streaming"))},
         "sleep_s": max(0, int(sl - time.time())) if sl else 0,
         "update": update_info(),
         "idle_handback_min": IDLE_HANDBACK_MIN,
+        "previous_input": previous_input(),
         "playing": any(x.playing for x in slots.slots),
         "now_playing": now_playing(),
         "accounts": sum(1 for x in slots.slots if x.paired),
@@ -1025,6 +1228,8 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(p.query)
         arg = lambda k: (qs.get(k) or [""])[0]
         code, out = 200, None
+        if p.path.startswith("/api/receiver/"):
+            invalidate_basic()               # state is about to change
         try:
             if p.path == "/api/status":
                 out = api_status()
@@ -1052,6 +1257,10 @@ class Handler(BaseHTTPRequestHandler):
                 m = float(arg("min") or 0)
                 sleep_timer["until"] = time.time() + m * 60 if m > 0 else None
                 out = {"ok": True}
+            elif p.path == "/api/bt/pair":
+                bt_pair_window(); out = {"ok": True}
+            elif p.path == "/api/bt/forget":
+                sh_out(["bluetoothctl", "remove", arg("mac")]); out = {"ok": True}
             elif p.path == "/api/handback":
                 hand_back_now(); out = {"ok": True}
             elif p.path == "/api/update":
@@ -1206,6 +1415,7 @@ def main():
     threading.Thread(target=health_monitor, daemon=True).start()
     threading.Thread(target=idle_handback, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
+    threading.Thread(target=bt_watch, daemon=True).start()
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:
