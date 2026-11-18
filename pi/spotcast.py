@@ -808,6 +808,27 @@ def health_monitor():
             pass
 
 
+def pin_stream_volumes():
+    """Soloist ties its PipeWire stream volume to the Spotify volume slider, so a
+    slider at 0 (e.g. after Alexa/phone changes) made the receiver silent. The
+    receiver is the volume control: keep every Spotify stream at 100%."""
+    while True:
+        time.sleep(2)
+        try:
+            out = sh_out(["pactl", "list", "sink-inputs"])
+            for block in out.split("Sink Input #")[1:]:
+                idx = block.split(chr(10), 1)[0].strip()
+                if 'application.name = "Spotify"' not in block:
+                    continue
+                m = re.search(r"Volume: \S+: (\d+) /", block)
+                if m and int(m.group(1)) != 65536:
+                    sh_out(["pactl", "set-sink-input-volume", idx, "100%"])
+                    log.info("spotify stream volume was %d%%; pinned to 100%%",
+                             round(int(m.group(1)) / 655.36))
+        except Exception as e:
+            log.info("pin_stream_volumes: %s", e)
+
+
 STREAM_IDLE_STOP_S = int(os.environ.get("SPOTCAST_STREAM_IDLE_STOP", "120"))
 
 
@@ -819,6 +840,8 @@ def stream_rest():
     while True:
         time.sleep(15)
         try:
+            if activity["last_sound"] == 0:
+                activity["last_sound"] = time.time()   # just started: no history yet
             quiet = time.time() - activity["last_sound"]
             if any(x.playing for x in slots.slots) or quiet < STREAM_IDLE_STOP_S:
                 continue
@@ -1713,6 +1736,7 @@ def main():
     threading.Thread(target=health_monitor, daemon=True).start()
     threading.Thread(target=idle_handback, daemon=True).start()
     threading.Thread(target=stream_rest, daemon=True).start()
+    threading.Thread(target=pin_stream_volumes, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
     threading.Thread(target=bt_watch, daemon=True).start()
     threading.Thread(target=keep_echo_connected, daemon=True).start()
