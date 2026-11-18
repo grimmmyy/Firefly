@@ -24,7 +24,7 @@ esac
 echo "==> packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  python3 ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 >/dev/null
+  python3 python3-venv ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 >/dev/null
 
 echo "==> service user"
 id spotcast >/dev/null 2>&1 || useradd -r -m -d /var/lib/spotcast-user -s /usr/sbin/nologin spotcast
@@ -63,14 +63,25 @@ umask 022
 chown spotcast /etc/spotcast/soloist.env
 chown -R spotcast /var/lib/spotcast /var/lib/spotcast-user
 
+echo "==> fauxmo (Alexa shim)"
+python3 -m venv /opt/spotcast-venv
+/opt/spotcast-venv/bin/pip install --quiet --upgrade pip
+/opt/spotcast-venv/bin/pip install --quiet 'fauxmo>=0.6.0'
+install -m 644 "$HERE/fauxmo-config.json" /etc/spotcast/fauxmo.json
+install -m 644 "$HERE/fauxmo.service" /etc/systemd/system/fauxmo.service
+
 echo "==> systemd"
 sed "s/997/$UID_SC/g" "$HERE/spotcast.service" > /etc/systemd/system/spotcast.service
 install -m 644 "$HERE/soloist-update.service" /etc/systemd/system/
 install -m 644 "$HERE/soloist-update.timer" /etc/systemd/system/
 systemctl daemon-reload
 sudo -u spotcast XDG_RUNTIME_DIR="/run/user/$UID_SC" systemctl --user restart pipewire pipewire-pulse wireplumber || true
-systemctl enable --now spotcast soloist-update.timer
+systemctl enable --now spotcast soloist-update.timer fauxmo
 
 echo
 echo "Done. In Spotify (on the same Wi-Fi), pick \"Living Room - Add me\" to link your account."
 echo "Status page: http://$(hostname -I | awk '{print $1}'):8090"
+echo
+echo "Alexa: open the Alexa app, say 'Alexa, discover devices'."
+echo "You should see: Spotify, Next Song, Previous Song, Receiver, Mute,"
+echo "  Sleep Timer, Hand Back, Volume Low/Medium/High."

@@ -1,0 +1,84 @@
+{
+  "FAUXMO": {
+    "ip_address": "auto"
+  },
+  "PLUGINS": {
+    "SimpleHTTPPlugin": {
+      "DEVICES": [
+        {
+          "name": "Spotify",
+          "port": 12340,
+          "on_cmd": "http://127.0.0.1:8090/api/control?cmd=play",
+          "off_cmd": "http://127.0.0.1:8090/api/control?cmd=pause",
+          "state_cmd": "http://127.0.0.1:8090/api/status",
+          "state_response_on": "\"playing\": true",
+          "state_response_off": "\"playing\": false",
+          "method": "GET"
+        },
+        {
+          "name": "Next Song",
+          "port": 12341,
+          "on_cmd": "http://127.0.0.1:8090/api/control?cmd=next",
+          "off_cmd": "http://127.0.0.1:8090/api/control?cmd=next",
+          "method": "GET"
+        },
+        {
+          "name": "Previous Song",
+          "port": 12342,
+          "on_cmd": "http://127.0.0.1:8090/api/control?cmd=prev",
+          "off_cmd": "http://127.0.0.1:8090/api/control?cmd=prev",
+          "method": "GET"
+        },
+        {
+          "name": "Receiver",
+          "port": 12343,
+          "on_cmd": "http://127.0.0.1:8090/api/receiver/power?on=1",
+          "off_cmd": "http://127.0.0.1:8090/api/receiver/power?on=0",
+          "method": "GET"
+        },
+        {
+          "name": "Mute",
+          "port": 12344,
+          "on_cmd": "http://127.0.0.1:8090/api/receiver/mute?on=1",
+          "off_cmd": "http://127.0.0.1:8090/api/receiver/mute?on=0",
+          "method": "GET"
+        },
+        {
+          "name": "Sleep Timer",
+          "port": 12345,
+          "on_cmd": "http://127.0.0.1:8090/api/sleep?min=30",
+          "off_cmd": "http://127.0.0.1:8090/api/sleep?min=0",
+          "method": "GET"
+        },
+        {
+          "name": "Hand Back",
+          "port": 12346,
+          "on_cmd": "http://127.0.0.1:8090/api/handback",
+          "off_cmd": "http://127.0.0.1:8090/api/handback",
+          "method": "GET"
+        },
+        {
+          "name": "Volume Low",
+          "port": 12347,
+          "on_cmd": "http://127.0.0.1:8090/api/receiver/volume?db=-35",
+          "off_cmd": "http://127.0.0.1:8090/api/receiver/volume?db=-35",
+          "method": "GET"
+        },
+        {
+          "name": "Volume Medium",
+          "port": 12348,
+          "on_cmd": "http://127.0.0.1:8090/api/receiver/volume?db=-25",
+          "off_cmd": "http://127.0.0.1:8090/api/receiver/volume?db=-25",
+          "method": "GET"
+        },
+        {
+          "name": "Volume High",
+          "port": 12349,
+          "on_cmd": "http://127.0.0.1:8090/api/receiver/volume?db=-15",
+          "off_cmd": "http://127.0.0.1:8090/api/receiver/volume?db=-15",
+          "method": "GET"
+        }
+      ]
+    }
+  }
+}
