@@ -984,6 +984,74 @@ def stream_live():
     return _live_cache["v"]
 
 
+A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
+
+
+def keep_echo_connected():
+    """Keep Bluetooth sources the user wants 'always on' (the Echo) connected.
+    Echo devices drop their pairing if hammered with refused connects, so:
+    only ever ask for their *Audio Source* profile (Pi = speaker), one try per
+    drop, with growing back-off, and never remove a pairing."""
+    state_file = "/var/lib/spotcast-user/bt_keep.json"
+    try:
+        keep = json.load(open(state_file))
+    except Exception:
+        keep = []
+    backoff = {m: 0 for m in keep}
+    next_try = {m: 0.0 for m in keep}
+    seen_connected = set()
+    while True:
+        time.sleep(20)
+        try:
+            for d in bt_devices():
+                mac = d["mac"]
+                if "Echo" in d["name"] and mac not in keep:
+                    keep.append(mac)                    # Echo paired: keep it on
+                    json.dump(keep, open(state_file, "w"))
+                    backoff[mac], next_try[mac] = 0, 0.0
+                if mac not in keep:
+                    continue
+                if d["connected"]:
+                    if mac not in seen_connected:
+                        log.info("bluetooth: %s connected", d["name"])
+                        event("bt-connected", name=d["name"])
+                    seen_connected.add(mac)
+                    backoff[mac], next_try[mac] = 0, 0.0
+                    health["echo_connected"] = True
+                    continue
+                health["echo_connected"] = False
+                if mac in seen_connected:
+                    seen_connected.discard(mac)
+                    log.info("bluetooth: %s disconnected; will retry gently", d["name"])
+                    event("bt-disconnected", name=d["name"])
+                    next_try[mac] = time.time() + 60          # give it a minute first
+                if time.time() < next_try.get(mac, 0):
+                    continue
+                if "Echo" in d["name"]:
+                    # Echo devices refuse every Pi-initiated connection (tested with
+                    # both profiles) and drop the pairing if pushed, so only watch
+                    # and remind; the Echo must connect ("Alexa, connect to ...").
+                    next_try[mac] = time.time() + 3600
+                    alert("echo-disconnected", f"{d['name']} isn't connected to the Living "
+                          "Room speaker - say 'Alexa, connect to Living Room Speaker'",
+                          every=12 * 3600)
+                    continue
+                out = sh_out(["bluetoothctl", "connect", mac, A2DP_SOURCE_UUID], timeout=25)
+                ok = "Connected: yes" in sh_out(["bluetoothctl", "info", mac])
+                log.info("bluetooth: reconnect %s -> %s", d["name"],
+                         "ok" if ok else (out.strip().splitlines() or ["refused"])[-1][:80])
+                if not ok:
+                    b = min(backoff.get(mac, 0) + 1, 3)
+                    backoff[mac] = b
+                    next_try[mac] = time.time() + {1: 900, 2: 1800, 3: 3600}[b]
+                    if b == 3:
+                        alert("echo-disconnected", f"{d['name']} is not connected to the "
+                              "Living Room speaker - say 'Alexa, connect to Living Room "
+                              "Speaker'", every=12 * 3600)
+        except Exception as e:
+            log.info("keep_echo_connected error: %s", e)
+
+
 def bt_pair_window(secs=120):
     sh_out(["bluetoothctl", "pairable", "on"])
     sh_out(["bluetoothctl", "discoverable", "on"])
@@ -1199,7 +1267,8 @@ def api_status():
                    "audio" if time.time() - activity["last_sound"] < 2 else None),
         "bluetooth": {"devices": bt_devices(),
                       "discoverable": "Discoverable: yes" in sh_out(["bluetoothctl", "show"]),
-                      "streaming": bool(health.get("bt_streaming"))},
+                      "streaming": bool(health.get("bt_streaming")),
+                      "echo_connected": health.get("echo_connected")},
         "sleep_s": max(0, int(sl - time.time())) if sl else 0,
         "update": update_info(),
         "idle_handback_min": IDLE_HANDBACK_MIN,
@@ -1422,6 +1491,7 @@ def main():
     threading.Thread(target=idle_handback, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
     threading.Thread(target=bt_watch, daemon=True).start()
+    threading.Thread(target=keep_echo_connected, daemon=True).start()
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:
