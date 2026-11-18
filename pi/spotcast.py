@@ -588,14 +588,38 @@ RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.12"))
 _rx_last = [0.0]
 
 
+rx_stats = {"ok": 0, "fail": 0, "first_fail": None, "last_ok": None, "log": []}
+
+
 def rx_request(req, timeout=5):
     with RX_GATE:
         wait = RX_MIN_GAP - (time.monotonic() - _rx_last[0])
         if wait > 0:
             time.sleep(wait)
+        what = (req.full_url.rsplit("/", 2)[-2] + ":" +
+                (req.headers.get("Soapaction") or req.headers.get("SOAPACTION") or
+                 (req.data or b"")[:60].decode("utf-8", "replace"))).replace(chr(10), " ")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read().decode("utf-8", "replace")
+                body = r.read().decode("utf-8", "replace")
+            if rx_stats["first_fail"]:
+                log.info("receiver control recovered after %ds down",
+                         time.time() - rx_stats["first_fail"])
+                event("rx-recovered", down_s=int(time.time() - rx_stats["first_fail"]))
+                rx_stats["first_fail"] = None
+            rx_stats["ok"] += 1
+            rx_stats["last_ok"] = time.time()
+            rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "ok", what[:70])])[-40:]
+            return body
+        except Exception as e:
+            rx_stats["fail"] += 1
+            rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "FAIL", what[:70])])[-40:]
+            if not rx_stats["first_fail"]:
+                rx_stats["first_fail"] = time.time()
+                # keep the requests that led up to the freeze for diagnosis
+                event("rx-down", error=str(e)[:120], last_requests=rx_stats["log"][-15:])
+                log.info("receiver control FAILED (%s); last requests logged", e)
+            raise
         finally:
             _rx_last[0] = time.monotonic()
 
@@ -700,7 +724,8 @@ def health_monitor():
     """Receiver reachability, Soloist build expiry, playback stalls."""
     last_pos, last_pos_t = None, time.time()
     while True:
-        time.sleep(15)
+        busy = any(x.playing for x in slots.slots) or time.time() - activity["last_sound"] < 60
+        time.sleep(15 if busy else 60)
         # receiver reachable?
         pw, inp = receiver_status()
         if pw == "On" and inp and inp != "PC":
@@ -787,7 +812,7 @@ prev_receiver = {}
 _basic = {"t": 0.0, "xml": None}
 
 
-def basic_status(max_age=2.0):
+def basic_status(max_age=4.0):
     """Main_Zone Basic_Status, shared by everything for max_age seconds."""
     if time.time() - _basic["t"] < max_age and _basic["xml"] is not None:
         return _basic["xml"]
@@ -1086,6 +1111,29 @@ class Follow:
         self.armed_until = time.time() + self.ARM_S
         log.info("follow: armed for %ds", self.ARM_S)
         event("follow-armed")
+        # "Alexa, play X" said just *before* "turn on the receiver": take a track
+        # that started on a linked account in the last RECENT_MS.
+        threading.Thread(target=self._grab_recent, daemon=True).start()
+
+    RECENT_MS = 45000
+
+    def _grab_recent(self):
+        best = None
+        for sl in list(slots.slots):
+            if not sl.paired:
+                continue
+            try:
+                out = subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{sl.port}",
+                                      "--json", "now"], capture_output=True, text=True,
+                                     timeout=5).stdout
+                ev = json.loads(out)
+            except Exception:
+                continue
+            pos = (ev.get("position") or {}).get("position_ms", 10 ** 9)
+            if ev.get("status") == "playing" and ev.get("is_active") is False                     and pos < self.RECENT_MS and (best is None or pos < best[0]):
+                best = (pos, sl, (ev.get("item") or {}).get("uri"))
+        if best:
+            self.remote_play(best[1], best[2])
 
     def off(self, why=""):
         if self.enabled:
