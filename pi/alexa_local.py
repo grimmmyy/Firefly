@@ -63,7 +63,20 @@ def receiver_get():
     return {"on": s.get("power") == "On", "bri": bri}
 
 
+_last_on = [0.0]
+
+
 def receiver_set(on=None, bri=None):
+    # Alexa often sends bri=254 along with (or right after) "turn on" to restore a
+    # light's brightness. For a receiver that would mean max volume, so ignore
+    # brightness that arrives within 5 s of a power command.
+    if on is not None:
+        _last_on[0] = time.time()
+    elif bri is not None and time.time() - _last_on[0] < 5:
+        log.info("ignoring bri=%s sent with power-on", bri)
+        bri = None
+    if on is not None and bri is not None:
+        bri = None
     if on is not None:
         api("receiver/power", on="1" if on else "0")
         # on = arm follow mode ("Alexa, play X" then moves to the receiver)
