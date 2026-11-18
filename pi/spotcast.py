@@ -915,9 +915,12 @@ def bt_watch():
         wanted = json.load(open(BT_STATE))
     except Exception:
         wanted = []
+    # Echo devices (Amazon OUI / name) only accept connections they start
+    wanted = [m for m in wanted
+              if "Echo" not in sh_out(["bluetoothctl", "info", m]).split("Alias:")[-1][:40]]
     if wanted:
         def reconnect():
-            for attempt in range(6):
+            for attempt in range(3):
                 time.sleep(10)
                 missing = [m for m in wanted
                            if "Connected: yes" not in sh_out(["bluetoothctl", "info", m])]
@@ -926,7 +929,10 @@ def bt_watch():
                     return
                 for m in missing:
                     sh_out(["bluetoothctl", "connect", m], timeout=20)
-            log.info("bluetooth: could not reconnect %s", ", ".join(wanted))
+            # Echo devices refuse Pi-initiated A2DP; they reconnect when told
+            # "Alexa, connect to Living Room Speaker". Stop retrying quietly.
+            log.info("bluetooth: %s didn't accept a reconnect from the Pi "
+                     "(normal for Echo; ask Alexa to connect)", ", ".join(wanted))
         threading.Thread(target=reconnect, daemon=True).start()
     last_saved = None
     while True:
