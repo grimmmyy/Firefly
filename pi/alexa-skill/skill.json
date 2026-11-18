@@ -1,0 +1,49 @@
+{
+  "manifest": {
+    "publishingInformation": {
+      "locales": {
+        "en-US": {
+          "name": "Firefly",
+          "summary": "Voice control for the Firefly Spotify bridge.",
+          "description": "Plays songs, artists, and playlists on your Firefly Pi bridge via Spotify. For personal use only; works only with an account you have linked to Spotify.",
+          "examplePhrases": [
+            "Alexa, ask Firefly to play Taylor Swift",
+            "Alexa, ask Firefly to play my chill playlist",
+            "Alexa, tell Firefly to pause"
+          ],
+          "keywords": ["spotify", "firefly", "receiver", "music"],
+          "smallIconUri": "https://example.com/icon-108.png",
+          "largeIconUri": "https://example.com/icon-512.png"
+        }
+      },
+      "isAvailableWorldwide": false,
+      "distributionCountries": ["US"],
+      "testingInstructions": "Personal skill; not for public distribution.",
+      "category": "SMART_HOME",
+      "distributionMode": "PUBLIC"
+    },
+    "apis": {
+      "custom": {
+        "endpoint": {
+          "uri": "https://REPLACE-ME.your-tunnel.example/alexa",
+          "sslCertificateType": "Wildcard"
+        }
+      }
+    },
+    "manifestVersion": "1.0",
+    "permissions": [],
+    "privacyAndCompliance": {
+      "allowsPurchases": false,
+      "containsAds": false,
+      "isChildDirected": false,
+      "isExportCompliant": true,
+      "usesPersonalInfo": true,
+      "locales": {
+        "en-US": {
+          "privacyPolicyUrl": "https://example.com/privacy",
+          "termsOfUseUrl": "https://example.com/terms"
+        }
+      }
+    }
+  }
+}

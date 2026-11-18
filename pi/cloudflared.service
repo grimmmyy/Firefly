@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudflare Tunnel for the Firefly Alexa skill
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudflared
+Group=cloudflared
+EnvironmentFile=/etc/cloudflared/tunnel.env
+# TUNNEL_TOKEN comes from Cloudflare Zero Trust dashboard; pi/alexa-skill/README.md has the one-time steps.
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
