@@ -96,7 +96,11 @@ class _SpotifyCard extends StatelessWidget {
                 Row(children: [
                   const Icon(Icons.queue_music, size: 14, color: FireflyTheme.spotify),
                   const SizedBox(width: 4),
-                  Text(s.playing ? 'PLAYING ON SPOTIFY' : 'SPOTIFY',
+                  Text(s.playing
+                      ? (s.playingAccount != null
+                          ? 'PLAYING · ${(s.playingAccount!['display_name'] as String? ?? '').split(' ').first.toUpperCase()}'
+                          : 'PLAYING ON SPOTIFY')
+                      : 'SPOTIFY',
                       style: const TextStyle(
                           fontSize: 11,
                           letterSpacing: 1,

@@ -4,6 +4,7 @@ import '../services/ssdp.dart';
 import '../theme.dart';
 import 'shell.dart';
 import 'widgets.dart';
+import 'account_tile.dart';
 
 class SettingsScreen extends StatelessWidget {
   final AppState app;
@@ -40,40 +41,59 @@ class SettingsScreen extends StatelessWidget {
         const Text('Settings', style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
 
         // ---------------------------------------------------------- people
-        SectionLabel('Spotify people · ${s.accounts} linked',
+        SectionLabel('Spotify accounts · ${s.accounts} linked',
             trailing: TextButton(onPressed: s.showAddMe, child: const Text('Show Add me'))),
         Card(
           child: Column(children: [
-            ListTile(
-              leading: const Icon(Icons.info_outline),
-              title: const Text('How people join'),
-              subtitle: const Text(
-                  'A new phone opening Spotify on home Wi-Fi sees “Living Room - Add me” '
-                  'for 10 minutes. Picking it once links that account for good.'),
+            if (s.accountsList.isEmpty)
+              const ListTile(
+                leading: Icon(Icons.person_off_outlined),
+                title: Text('No accounts linked yet'),
+                subtitle: Text('In Spotify on home Wi-Fi, pick "Living Room - Add me".'),
+              ),
+            for (final a in s.accountsList) AccountTile(account: a, spot: s),
+            const Divider(height: 1),
+            const ListTile(
+              dense: true,
+              leading: Icon(Icons.info_outline),
+              title: Text('How people join'),
+              subtitle: Text(
+                  'A new phone opening Spotify on home Wi-Fi sees "Living Room - Add me". '
+                  'Picking it once links that account for good. For Alexa, link the same '
+                  'Spotify account in the Alexa app under that person’s voice profile.'),
             ),
-            for (final e in unknown.entries)
-              ListTile(
-                leading: const Icon(Icons.devices_other, color: Colors.orangeAccent),
-                title: Text('Unregistered device ${(e.value as Map)['ip'] ?? ''}'),
-                subtitle: Text('${e.key} · keeps “Add me” visible'),
-                trailing: TextButton(onPressed: () => s.ignore(e.key), child: const Text('Ignore')),
-              ),
-            for (final e in reg.entries)
-              ListTile(
-                leading: const Icon(Icons.phone_iphone, color: FireflyTheme.spotify),
-                title: Text('Registered ${(e.value as Map)['ip'] ?? ''}'),
-                subtitle: Text(e.key),
-                trailing: TextButton(onPressed: () => s.forget(e.key), child: const Text('Forget')),
-              ),
-            for (final e in ignored.entries)
-              ListTile(
-                leading: const Icon(Icons.block, color: Colors.white38),
-                title: Text('Ignored ${(e.value as Map)['ip'] ?? ''}'),
-                subtitle: Text(e.key),
-                trailing: TextButton(onPressed: () => s.forget(e.key), child: const Text('Un-ignore')),
-              ),
           ]),
         ),
+        if (unknown.isNotEmpty || reg.isNotEmpty || ignored.isNotEmpty) ...[
+          const SectionLabel('Devices'),
+          Card(
+            child: Column(children: [
+              for (final e in unknown.entries)
+                ListTile(
+                  leading: const Icon(Icons.devices_other, color: Colors.orangeAccent),
+                  title: Text('Unregistered device ${(e.value as Map)['ip'] ?? ''}'),
+                  subtitle: Text('${e.key} · keeps "Add me" visible'),
+                  trailing: TextButton(onPressed: () => s.ignore(e.key), child: const Text('Ignore')),
+                ),
+              for (final e in reg.entries)
+                ListTile(
+                  leading: const Icon(Icons.phone_iphone, color: FireflyTheme.spotify),
+                  title: Text(s.displayNameFor((e.value as Map)['account'] as String?) != null
+                      ? "${s.displayNameFor((e.value as Map)['account'] as String?)}’s device"
+                      : 'Registered device'),
+                  subtitle: Text('${(e.value as Map)['ip'] ?? ''} · ${e.key}'),
+                  trailing: TextButton(onPressed: () => s.forget(e.key), child: const Text('Forget')),
+                ),
+              for (final e in ignored.entries)
+                ListTile(
+                  leading: const Icon(Icons.block, color: Colors.white38),
+                  title: Text('Ignored ${(e.value as Map)['ip'] ?? ''}'),
+                  subtitle: Text(e.key),
+                  trailing: TextButton(onPressed: () => s.forget(e.key), child: const Text('Un-ignore')),
+                ),
+            ]),
+          ),
+        ],
 
         // ---------------------------------------------------------- receiver (DLNA)
         SectionLabel('Receiver for radio & files',

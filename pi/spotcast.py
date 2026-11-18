@@ -360,6 +360,40 @@ class Slot:
     def name(self):
         return NAME if self.paired else SPARE_NAME
 
+    def profile(self, refresh=False):
+        """{'username', 'display_name', 'image'} for this slot's account.
+        Read from Spotify's public profile page (no login needed), cached a day."""
+        acct = self.account()
+        if not acct:
+            return {}
+        path = f"{self.dir}/profile.json"
+        try:
+            prof = json.load(open(path))
+            if prof.get("username") == acct and not refresh and \
+                    time.time() - prof.get("fetched", 0) < 86400:
+                return prof
+        except Exception:
+            prof = {}
+        prof = {"username": acct, "display_name": prof.get("display_name"),
+                "image": prof.get("image"), "fetched": time.time()}
+        try:
+            req = urllib.request.Request(f"https://open.spotify.com/user/{acct}",
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            page = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", "replace")
+            m = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+            i = re.search(r'<meta property="og:image" content="([^"]*)"', page)
+            if m:
+                prof["display_name"] = html.unescape(m.group(1))
+            if i:
+                prof["image"] = html.unescape(i.group(1))
+        except Exception as e:
+            log.info("profile lookup for slot %d failed: %s", self.n, e)
+        try:
+            json.dump(prof, open(path, "w"))
+        except OSError:
+            pass
+        return prof
+
     def is_active(self):
         try:
             out = subprocess.run(["soloist", "ctl", "--ws", f"127.0.0.1:{self.port}", "status"],
@@ -433,6 +467,8 @@ class Slot:
                     with open(f"{self.dir}/paired", "w") as f:
                         f.write(acct)
                     log.info("slot %d claimed by account %s", self.n, acct[:6] + "...")
+                    threading.Thread(target=self.profile, kwargs={"refresh": True},
+                                     daemon=True).start()
                     devices.register_claim(acct)
                     self.mgr.drop_duplicates(self, acct)
                     self.mgr.add_until = 0
@@ -522,6 +558,8 @@ class SlotManager:
             self.add_until = time.time() + ADD_WINDOW
         self.ensure_spare()
         threading.Thread(target=self.reap, daemon=True).start()
+        threading.Thread(target=lambda: [x.profile() for x in list(self.slots) if x.paired],
+                         daemon=True).start()
         threading.Thread(target=devices.watch_pollers, daemon=True).start()
         threading.Thread(target=devices.sniff, daemon=True).start()
 
@@ -1395,6 +1433,28 @@ def now_playing():
     return None
 
 
+def accounts_list():
+    out = []
+    owner = follow.owner
+    for sl in sorted(slots.slots, key=lambda x: x.n):
+        if not sl.paired:
+            continue
+        prof = sl.profile()
+        acct = sl.account()
+        devs = [{"mac": m, "ip": v.get("ip")} for m, v in devices.reg.items()
+                if v.get("account") == acct]
+        out.append({
+            "slot": sl.n,
+            "username": acct,
+            "display_name": prof.get("display_name") or acct,
+            "image": prof.get("image"),
+            "on_receiver": bool(sl.playing),
+            "follow_owner": bool(owner and owner == acct),
+            "devices": devs,
+        })
+    return out
+
+
 def api_status():
     pw, inp = receiver_status()
     vol, mute = receiver_volume()
@@ -1418,6 +1478,7 @@ def api_status():
         "playing": any(x.playing for x in slots.slots),
         "now_playing": now_playing(),
         "accounts": sum(1 for x in slots.slots if x.paired),
+        "accounts_list": accounts_list(),
         "add_me_visible_s": slots.add_window_left(),
         "devices": {"registered": devices.reg, "ignored": devices.ignored,
                     "unknown": devices.unknown},
@@ -1478,6 +1539,20 @@ class Handler(BaseHTTPRequestHandler):
                 bt_pair_window(); out = {"ok": True}
             elif p.path == "/api/bt/forget":
                 sh_out(["bluetoothctl", "remove", arg("mac")]); out = {"ok": True}
+            elif p.path == "/api/account/remove":
+                n = int(arg("slot"))
+                sl = next((x for x in slots.slots if x.n == n and x.paired), None)
+                if not sl:
+                    raise ValueError("no such account slot")
+                acct = sl.account()
+                with slots.lock:
+                    slots.retire(sl)
+                for m in [m for m, v in devices.reg.items() if v.get("account") == acct]:
+                    devices.forget(m)
+                log.info("account %s unlinked (slot %d)", acct[:6] + "...", n)
+                event("account-removed", slot=n)
+                slots.ensure_spare()
+                out = {"ok": True}
             elif p.path == "/api/follow":
                 if arg("on") in ("1", "true", "on"):
                     follow.arm()

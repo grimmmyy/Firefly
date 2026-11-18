@@ -111,6 +111,26 @@ class SpotcastController extends ChangeNotifier {
   List get queue => (status?['queue'] as List?) ?? const [];
   int get sleepSeconds => (status?['sleep_s'] as num?)?.toInt() ?? 0;
   int get accounts => (status?['accounts'] as num?)?.toInt() ?? 0;
+  List<Map> get accountsList =>
+      ((status?['accounts_list'] as List?) ?? const []).cast<Map>();
+
+  /// The linked account currently playing on the receiver, if any.
+  Map? get playingAccount {
+    for (final a in accountsList) {
+      if (a['on_receiver'] == true) return a;
+    }
+    return null;
+  }
+
+  String? displayNameFor(String? username) {
+    if (username == null) return null;
+    for (final a in accountsList) {
+      if (a['username'] == username) return a['display_name'] as String?;
+    }
+    return null;
+  }
+
+  Map get follow => (status?['follow'] ?? const {}) as Map;
   int get addMeSeconds => (status?['add_me_visible_s'] as num?)?.toInt() ?? 0;
   Map get devices => (status?['devices'] ?? const {}) as Map;
   Map get latency => (status?['latency'] ?? const {}) as Map;
@@ -130,6 +150,8 @@ class SpotcastController extends ChangeNotifier {
   Future<void> handBack() => _call('handback');
   Future<void> sleep(int minutes) => _call('sleep', {'min': '$minutes'});
   Future<void> updateNow() => _call('update');
+  Future<void> unlinkAccount(int slot) => _call('account/remove', {'slot': '$slot'});
+  Future<void> armFollow() => _call('follow', {'on': '1'});
 
   /// Optimistic local volume while dragging; sent when the drag settles.
   void previewVolume(double db) {
