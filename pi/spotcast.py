@@ -770,6 +770,30 @@ def health_monitor():
             pass
 
 
+STREAM_IDLE_STOP_S = int(os.environ.get("SPOTCAST_STREAM_IDLE_STOP", "120"))
+
+
+def stream_rest():
+    """Don't keep an endless (silent) stream open to the receiver: its 2011
+    firmware has frozen its network module after long sessions. After
+    STREAM_IDLE_STOP_S of silence, Stop the transport; any new sound restarts
+    it (ensure_playing), costing ~0.5 s on the first song."""
+    while True:
+        time.sleep(15)
+        try:
+            quiet = time.time() - activity["last_sound"]
+            if any(x.playing for x in slots.slots) or quiet < STREAM_IDLE_STOP_S:
+                continue
+            if wav_hub.count() == 0:
+                continue                         # receiver isn't pulling anyway
+            soap("AVTransport", "Stop", [("InstanceID", 0)])
+            _live_cache["t"] = 0.0
+            log.info("stream rested after %ds of silence", int(quiet))
+            event("stream-rest")
+        except Exception as e:
+            log.info("stream_rest: %s", e)
+
+
 def idle_handback():
     """After IDLE_HANDBACK_MIN minutes with nothing playing, give the receiver back:
     restore the input it was on (or standby if we woke it)."""
@@ -1613,6 +1637,7 @@ def main():
     threading.Thread(target=buffer_tuner, daemon=True).start()
     threading.Thread(target=health_monitor, daemon=True).start()
     threading.Thread(target=idle_handback, daemon=True).start()
+    threading.Thread(target=stream_rest, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
     threading.Thread(target=bt_watch, daemon=True).start()
     threading.Thread(target=keep_echo_connected, daemon=True).start()
