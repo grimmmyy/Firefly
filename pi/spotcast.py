@@ -208,6 +208,16 @@ def start_pipeline():
 import json, shutil
 
 SPARE_NAME = os.environ.get("SPOTCAST_SPARE_NAME", "Living Room - Add me")
+# MODE "shared" (default since 2026-11-18): one LAN-visible "Living Room
+# (RX-V671)" that anyone on the network can pick; picking it hands it to that
+# account (Spotify Connect hand-off, ~0.5 s). Plus one hidden slot for the
+# account Alexa plays under, so "Alexa, play X" can still be followed.
+# Other linked slots are kept on disk but not started. MODE "accounts" is the
+# previous one-slot-per-account + "Add me" behaviour.
+MODE = os.environ.get("SPOTCAST_MODE", "shared")
+ALEXA_ACCOUNT = os.environ.get("SPOTCAST_ALEXA_ACCOUNT", "")
+ALEXA_NAME = os.environ.get("SPOTCAST_ALEXA_NAME", "Living Room (Alexa)")
+SHARED_N = 50          # shared slot: dir slots/shared, ws port 9150
 MAX_SLOTS = int(os.environ.get("SPOTCAST_MAX_SLOTS", "6"))
 SLOT_ROOT = "/var/lib/spotcast-user/slots"
 HIDDEN_PROCS = "/sys/fs/cgroup/system.slice/spotcast.service/hidden/cgroup.procs"
@@ -334,6 +344,9 @@ class Slot:
         self.dir = f"{SLOT_ROOT}/{n}"
         self.port = 9100 + n
         self.proc = None
+        self.shared = n == SHARED_N
+        if self.shared:
+            self.dir = f"{SLOT_ROOT}/shared"
         self._playing = False      # from Soloist: playing AND the active device
         self.sounding = False      # from the mixer: its audio is reaching the receiver
         os.makedirs(self.dir, exist_ok=True)
@@ -370,7 +383,13 @@ class Slot:
             return ""
 
     def name(self):
-        return NAME if self.paired else SPARE_NAME
+        if self.shared:
+            return NAME
+        if not self.paired:
+            return SPARE_NAME
+        if MODE == "shared" and ALEXA_ACCOUNT and self.account() == ALEXA_ACCOUNT:
+            return ALEXA_NAME
+        return NAME
 
     def profile(self, refresh=False):
         """{'username', 'display_name', 'image'} for this slot's account.
@@ -426,7 +445,7 @@ class Slot:
                  "--api-key", os.environ["SOLOIST_API_KEY"], "--data-dir", self.dir,
                  "--ws", f"127.0.0.1:{self.port}", "--initial-volume", "100",
                    "--cache-size", os.environ.get("SPOTCAST_CACHE_MB", "300")]
-            if self.paired:
+            if self.paired and not self.shared:
                 # Linked account: join the "hidden" cgroup *before* exec, so the
                 # mDNS socket Soloist opens is covered by spotcast-hide.sh's
                 # firewall rule. Fails open (visible) if the cgroup is missing.
@@ -438,7 +457,7 @@ class Slot:
                                          stderr=subprocess.STDOUT, text=True)
             threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
             threading.Thread(target=self.watch, args=(self.proc,), daemon=True).start()
-            if not self.paired:
+            if not self.paired and not self.shared:
                 threading.Thread(target=devices.set_spare, args=(self.proc.pid,),
                                  daemon=True).start()
             rc = self.proc.wait()
@@ -480,7 +499,10 @@ class Slot:
                 except Exception:
                     continue
                 t = ev.get("type")
-                if t == "auth_state" and ev.get("logged_in") and not self.paired:
+                if t == "auth_state" and ev.get("logged_in") and self.shared:
+                    log.info("shared slot: now %s", (self.account() or "?")[:6] + "...")
+                    event("shared-handoff")
+                elif t == "auth_state" and ev.get("logged_in") and not self.paired:
                     time.sleep(2)                       # let Soloist write its user dir
                     open(f"{self.dir}/paired", "w").close()
                     acct = self.account()
@@ -528,12 +550,16 @@ class SlotManager:
         self.add_until = 0.0
 
     def open_add_window(self, quiet=False):
+        if MODE == "shared":
+            return                       # no "Add me" in shared mode
         self.add_until = time.time() + ADD_WINDOW
         if not quiet:
             log.info("add window open for %ds", ADD_WINDOW)
         self.ensure_spare()
 
     def add_window_left(self):
+        if MODE == "shared":
+            return 0
         if PERMANENT_SPARE:
             return 10 ** 9
         return max(0, int(self.add_until - time.time()))
@@ -546,7 +572,7 @@ class SlotManager:
             if self.add_window_left() > 0:
                 continue
             with self.lock:
-                for sl in [x for x in self.slots if not x.paired]:
+                for sl in [x for x in self.slots if not x.paired and not x.shared]:
                     log.info("add window closed; removing spare slot %d", sl.n)
                     sl.retired = True
                     if sl.proc:
@@ -562,9 +588,25 @@ class SlotManager:
         ns = sorted(int(d) for d in os.listdir(SLOT_ROOT) if d.isdigit())
         for n in ns:
             if os.path.exists(f"{SLOT_ROOT}/{n}/paired"):
+                if MODE == "shared" and ALEXA_ACCOUNT:
+                    try:
+                        acct = open(f"{SLOT_ROOT}/{n}/paired").read().strip()
+                    except OSError:
+                        acct = ""
+                    if acct != ALEXA_ACCOUNT:
+                        log.info("shared mode: slot %d kept on disk, not started", n)
+                        continue
                 self._spawn(n)
             else:
                 shutil.rmtree(f"{SLOT_ROOT}/{n}", ignore_errors=True)
+        if MODE == "shared":
+            os.makedirs(f"{SLOT_ROOT}/shared", exist_ok=True)
+            self._spawn(SHARED_N)
+            log.info("shared mode: '%s' open to everyone; Alexa slot: %s", NAME,
+                     "yes" if any(x.paired for x in self.slots) else "none")
+            threading.Thread(target=lambda: [x.profile() for x in list(self.slots) if x.paired],
+                             daemon=True).start()
+            return
         seen = {}
         for sl in sorted(self.slots, key=lambda x: os.path.getmtime(f"{x.dir}/paired"),
                          reverse=True):
@@ -590,6 +632,8 @@ class SlotManager:
         return sl
 
     def ensure_spare(self):
+        if MODE == "shared":
+            return
         with self.lock:
             if self.add_window_left() <= 0:
                 return
