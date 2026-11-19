@@ -866,28 +866,44 @@ def health_monitor():
 
 
 _mix_lock = threading.Lock()
+_uncorked = set()   # Spotify sink inputs that were producing audio last pass
 
 
 def enforce_single_output():
     """Only the slot that most recently took over may be heard. A slot whose
     account disconnected is no longer 'active', so it isn't paused, but its
     Soloist can keep rendering into the shared sink; mute every Spotify stream
-    that doesn't belong to the current slot (unmute it when it takes over)."""
-    cur = slots.current
-    if cur is None or cur.proc is None or cur.proc.poll() is not None:
-        return
+    that doesn't belong to the current slot (unmute it when it takes over).
+    Soloist's "active device" flag can lag or stay false while a slot plays
+    (seen with Alexa follow), so the audio decides too: the slot whose stream
+    most recently started producing sound becomes current."""
     with _mix_lock:
         pids = {}
         for block in sh_out(["pactl", "list", "clients"]).split("Client #")[1:]:
             m = re.search(r'application.process.id = "(\d+)"', block)
             if m:
                 pids[block.split(chr(10), 1)[0].strip()] = int(m.group(1))
+        by_pid = {sl.proc.pid: sl for sl in list(slots.slots)
+                  if sl.proc and sl.proc.poll() is None}
+        streams = []
         for block in sh_out(["pactl", "list", "sink-inputs"]).split("Sink Input #")[1:]:
             if 'application.name = "Spotify"' not in block:
                 continue
             idx = block.split(chr(10), 1)[0].strip()
             m = re.search(r"Client: (\d+)", block)
-            want = pids.get(m.group(1) if m else "") != cur.proc.pid
+            sl = by_pid.get(pids.get(m.group(1) if m else ""))
+            streams.append((idx, sl, "Corked: no" in block, block))
+        now_uncorked = {idx for idx, _, live, _ in streams if live}
+        for idx, sl, live, _ in streams:
+            if live and idx not in _uncorked and sl is not None and sl is not slots.current:
+                log.info("mixer: slot %d started sounding; it is now the current slot", sl.n)
+                slots.current = sl
+        _uncorked.clear(); _uncorked.update(now_uncorked)
+        cur = slots.current
+        if cur is None or cur.proc is None or cur.proc.poll() is not None:
+            return
+        for idx, sl, live, block in streams:
+            want = sl is not cur
             muted = "Mute: yes" in block
             if want != muted:
                 sh_out(["pactl", "set-sink-input-mute", idx, "1" if want else "0"])
@@ -901,10 +917,14 @@ def pin_stream_volumes():
     """Soloist ties its PipeWire stream volume to the Spotify volume slider, so a
     slider at 0 (e.g. after Alexa/phone changes) made the receiver silent. The
     receiver is the volume control: keep every Spotify stream at 100%."""
+    n = 0
     while True:
-        time.sleep(2)
+        time.sleep(1)
+        n += 1
         try:
             enforce_single_output()
+            if n % 2:
+                continue                     # volume pin every 2 s as before
             out = sh_out(["pactl", "list", "sink-inputs"])
             for block in out.split("Sink Input #")[1:]:
                 idx = block.split(chr(10), 1)[0].strip()
