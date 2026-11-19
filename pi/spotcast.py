@@ -601,8 +601,12 @@ class SlotManager:
                              acct[:6] + "...", sl.n)
                     self.retire(sl)
 
+    current = None   # the one slot whose audio may reach the receiver
+
     def took_over(self, slot):
         log.info("slot %d started playing; pausing others", slot.n)
+        self.current = slot
+        threading.Thread(target=enforce_single_output, daemon=True).start()
         for s in self.slots:
             # Only pause a slot that is still the active output for its account;
             # pausing an inactive slot would pause that account on other devices.
@@ -861,6 +865,38 @@ def health_monitor():
             pass
 
 
+_mix_lock = threading.Lock()
+
+
+def enforce_single_output():
+    """Only the slot that most recently took over may be heard. A slot whose
+    account disconnected is no longer 'active', so it isn't paused, but its
+    Soloist can keep rendering into the shared sink; mute every Spotify stream
+    that doesn't belong to the current slot (unmute it when it takes over)."""
+    cur = slots.current
+    if cur is None or cur.proc is None or cur.proc.poll() is not None:
+        return
+    with _mix_lock:
+        pids = {}
+        for block in sh_out(["pactl", "list", "clients"]).split("Client #")[1:]:
+            m = re.search(r'application.process.id = "(\d+)"', block)
+            if m:
+                pids[block.split(chr(10), 1)[0].strip()] = int(m.group(1))
+        for block in sh_out(["pactl", "list", "sink-inputs"]).split("Sink Input #")[1:]:
+            if 'application.name = "Spotify"' not in block:
+                continue
+            idx = block.split(chr(10), 1)[0].strip()
+            m = re.search(r"Client: (\d+)", block)
+            want = pids.get(m.group(1) if m else "") != cur.proc.pid
+            muted = "Mute: yes" in block
+            if want != muted:
+                sh_out(["pactl", "set-sink-input-mute", idx, "1" if want else "0"])
+                log.info("mixer: %s stream %s (current slot %d)",
+                         "muted" if want else "unmuted", idx, cur.n)
+                if want:
+                    event("muted-other-slot", sink_input=idx, current=cur.n)
+
+
 def pin_stream_volumes():
     """Soloist ties its PipeWire stream volume to the Spotify volume slider, so a
     slider at 0 (e.g. after Alexa/phone changes) made the receiver silent. The
@@ -868,6 +904,7 @@ def pin_stream_volumes():
     while True:
         time.sleep(2)
         try:
+            enforce_single_output()
             out = sh_out(["pactl", "list", "sink-inputs"])
             for block in out.split("Sink Input #")[1:]:
                 idx = block.split(chr(10), 1)[0].strip()
