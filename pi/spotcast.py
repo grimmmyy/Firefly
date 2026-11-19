@@ -10,7 +10,7 @@ librespot --onevent posts player events to /event; on "playing" we make sure
 the receiver is powered on and playing our stream.
 """
 import os, sys, re, time, struct, threading, subprocess, socket, html, logging
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, http.client
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 RECEIVER = os.environ.get("SPOTCAST_RECEIVER", "192.168.1.7")
@@ -603,8 +603,6 @@ class SlotManager:
 
     def took_over(self, slot):
         log.info("slot %d started playing; pausing others", slot.n)
-        if health.get("bt_streaming"):
-            threading.Thread(target=bt_pause, daemon=True).start()
         for s in self.slots:
             # Only pause a slot that is still the active output for its account;
             # pausing an inactive slot would pause that account on other devices.
@@ -626,11 +624,58 @@ RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.12"))
 _rx_last = [0.0]
 
 
-rx_stats = {"ok": 0, "fail": 0, "first_fail": None, "last_ok": None, "log": []}
+rx_stats = {"ok": 0, "fail": 0, "first_fail": None, "last_ok": None, "log": [],
+            "streak": 0, "retry_at": 0.0}
+
+# After consecutive failures, don't touch the receiver again until the back-off
+# step has passed (2 s, 5 s, 15 s, then 60 s); a frozen network module gets
+# quiet time to recover instead of a queue of retries.
+RX_BACKOFF = (2, 5, 15, 60)
 
 
-def rx_request(req, timeout=5):
+class ReceiverBackoff(OSError):
+    pass
+
+
+# One kept-open HTTP/1.1 connection per receiver port (YNC :80, UPnP :49154).
+# All use is serialised by RX_GATE, so no locking of its own.
+_rx_conns = {}
+
+
+def _rx_send(port, path, data, headers, timeout, method="POST"):
+    for attempt in (1, 2):
+        conn = _rx_conns.get(port)
+        fresh = conn is None
+        if fresh:
+            conn = _rx_conns[port] = http.client.HTTPConnection(RECEIVER, port, timeout=timeout)
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            r = conn.getresponse()
+            body = r.read().decode("utf-8", "replace")
+            if r.will_close:
+                conn.close(); _rx_conns.pop(port, None)
+            if r.status >= 400:
+                raise urllib.error.HTTPError(f"http://{RECEIVER}:{port}{path}", r.status,
+                                             r.reason, r.headers, None)
+            return body, r.headers
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
+                http.client.CannotSendRequest, http.client.BadStatusLine):
+            # the receiver closed an idle kept-open socket: reconnect once
+            conn.close(); _rx_conns.pop(port, None)
+            if fresh or attempt == 2:
+                raise
+        except Exception:
+            conn.close(); _rx_conns.pop(port, None)
+            raise
+
+
+def rx_request(req, timeout=5, with_headers=False):
     with RX_GATE:
+        if time.time() < rx_stats["retry_at"]:
+            raise ReceiverBackoff(f"receiver backing off {rx_stats['retry_at'] - time.time():.0f}s")
         wait = RX_MIN_GAP - (time.monotonic() - _rx_last[0])
         if wait > 0:
             time.sleep(wait)
@@ -638,8 +683,10 @@ def rx_request(req, timeout=5):
                 (req.headers.get("Soapaction") or req.headers.get("SOAPACTION") or
                  (req.data or b"")[:60].decode("utf-8", "replace"))).replace(chr(10), " ")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                body = r.read().decode("utf-8", "replace")
+            u = urllib.parse.urlsplit(req.full_url)
+            body, hdrs = _rx_send(u.port or 80, u.path, req.data, dict(req.header_items()),
+                                  timeout, req.get_method())
+            rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
             if rx_stats["first_fail"]:
                 log.info("receiver control recovered after %ds down",
                          time.time() - rx_stats["first_fail"])
@@ -648,9 +695,15 @@ def rx_request(req, timeout=5):
             rx_stats["ok"] += 1
             rx_stats["last_ok"] = time.time()
             rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "ok", what[:70])])[-40:]
-            return body
+            return (body, hdrs) if with_headers else body
         except Exception as e:
             rx_stats["fail"] += 1
+            if isinstance(e, urllib.error.HTTPError):
+                raise                        # it answered: alive, no back-off
+            rx_stats["streak"] += 1
+            step = RX_BACKOFF[min(rx_stats["streak"], len(RX_BACKOFF)) - 1]
+            rx_stats["retry_at"] = time.time() + step
+            log.info("receiver request failed (%s); backing off %ds", e, step)
             rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "FAIL", what[:70])])[-40:]
             if not rx_stats["first_fail"]:
                 rx_stats["first_fail"] = time.time()
@@ -988,104 +1041,18 @@ def sh_out(cmd, timeout=6):
         return ""
 
 
-def bt_devices():
-    """Paired Bluetooth devices: [{mac, name, connected, trusted}]."""
-    out = []
-    for line in sh_out(["bluetoothctl", "devices", "Paired"]).splitlines():
-        parts = line.split(" ", 2)
-        if len(parts) < 3:
-            continue
-        mac, name = parts[1], parts[2]
-        info = sh_out(["bluetoothctl", "info", mac])
-        out.append({"mac": mac, "name": name,
-                    "connected": "Connected: yes" in info,
-                    "trusted": "Trusted: yes" in info})
-    return out
-
-
-def bt_streaming():
-    """True if a Bluetooth phone/Echo is feeding audio into PipeWire right now."""
-    out = sh_out(["pactl", "list", "sink-inputs"])
-    for block in out.split("Sink Input #")[1:]:
-        if "bluez" in block and "Corked: no" in block:
-            return True
-    return False
-
-
-def bt_pause():
-    # AVRCP pause to whatever is streaming over Bluetooth (best effort)
-    for d in bt_devices():
-        if d["connected"]:
-            sh_out(["bluetoothctl", "player.pause"])
-            return
-
-
-def bt_watch():
-    """Trust newly paired devices; arbitrate Spotify vs Bluetooth (newest wins);
-    wake the receiver when any source starts making sound."""
-    was_bt = False
-    BT_STATE = "/var/lib/spotcast-user/bt_connected.json"
-    # after a reboot / restart: reconnect devices that were connected before
-    try:
-        wanted = json.load(open(BT_STATE))
-    except Exception:
-        wanted = []
-    # Echo devices (Amazon OUI / name) only accept connections they start
-    wanted = [m for m in wanted
-              if "Echo" not in sh_out(["bluetoothctl", "info", m]).split("Alias:")[-1][:40]]
-    if wanted:
-        def reconnect():
-            for attempt in range(3):
-                time.sleep(10)
-                missing = [m for m in wanted
-                           if "Connected: yes" not in sh_out(["bluetoothctl", "info", m])]
-                if not missing:
-                    log.info("bluetooth: reconnected %s", ", ".join(wanted))
-                    return
-                for m in missing:
-                    sh_out(["bluetoothctl", "connect", m], timeout=20)
-            # Echo devices refuse Pi-initiated A2DP; they reconnect when told
-            # "Alexa, connect to Living Room Speaker". Stop retrying quietly.
-            log.info("bluetooth: %s didn't accept a reconnect from the Pi "
-                     "(normal for Echo; ask Alexa to connect)", ", ".join(wanted))
-        threading.Thread(target=reconnect, daemon=True).start()
-    last_saved = None
+def sound_watch():
+    """Any source producing sound -> make sure the receiver plays our stream."""
     while True:
         time.sleep(1)
         try:
-            # remember which devices are connected (so a reboot restores them)
-            if int(time.time()) % 10 == 0:
-                conn = sorted(d["mac"] for d in bt_devices() if d["connected"])
-                if conn != last_saved and (conn or last_saved is not None):
-                    try:
-                        json.dump(conn, open(BT_STATE, "w"))
-                    except OSError:
-                        pass
-                    last_saved = conn
-            # trust paired devices so they can reconnect without pairing again
-            if int(time.time()) % 15 == 0:
-                for d in bt_devices():
-                    if not d["trusted"]:
-                        sh_out(["bluetoothctl", "trust", d["mac"]])
-                        log.info("bluetooth: trusted %s (%s)", d["name"], d["mac"])
-                        event("bt-paired", name=d["name"])
-            now_bt = bt_streaming()
-            if now_bt and not was_bt:
-                log.info("bluetooth audio started; pausing Spotify slots")
-                event("bt-start")
-                for x in slots.slots:
-                    if x.playing and x.is_active():
-                        x.ctl("pause"); x.playing = False
-            was_bt = now_bt
-            health["bt_streaming"] = now_bt
-            # any source producing sound -> make sure the receiver plays our stream
             if time.time() - activity["last_sound"] < 1.0:
                 health["last_playing"], health["handed_back"] = time.time(), False
                 if not stream_live():
                     threading.Thread(target=ensure_playing, daemon=True).start()
                     time.sleep(3)
         except Exception as e:
-            log.info("bt_watch error: %s", e)
+            log.info("sound_watch error: %s", e)
 
 
 _live_cache = {"t": 0.0, "v": False}
@@ -1097,74 +1064,6 @@ def stream_live():
     st, uri = transport_state()
     _live_cache.update(t=time.time(), v=(st == "PLAYING" and uri == STREAM_URL))
     return _live_cache["v"]
-
-
-A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
-
-
-def keep_echo_connected():
-    """Keep Bluetooth sources the user wants 'always on' (the Echo) connected.
-    Echo devices drop their pairing if hammered with refused connects, so:
-    only ever ask for their *Audio Source* profile (Pi = speaker), one try per
-    drop, with growing back-off, and never remove a pairing."""
-    state_file = "/var/lib/spotcast-user/bt_keep.json"
-    try:
-        keep = json.load(open(state_file))
-    except Exception:
-        keep = []
-    backoff = {m: 0 for m in keep}
-    next_try = {m: 0.0 for m in keep}
-    seen_connected = set()
-    while True:
-        time.sleep(20)
-        try:
-            for d in bt_devices():
-                mac = d["mac"]
-                if "Echo" in d["name"] and mac not in keep:
-                    keep.append(mac)                    # Echo paired: keep it on
-                    json.dump(keep, open(state_file, "w"))
-                    backoff[mac], next_try[mac] = 0, 0.0
-                if mac not in keep:
-                    continue
-                if d["connected"]:
-                    if mac not in seen_connected:
-                        log.info("bluetooth: %s connected", d["name"])
-                        event("bt-connected", name=d["name"])
-                    seen_connected.add(mac)
-                    backoff[mac], next_try[mac] = 0, 0.0
-                    health["echo_connected"] = True
-                    continue
-                health["echo_connected"] = False
-                if mac in seen_connected:
-                    seen_connected.discard(mac)
-                    log.info("bluetooth: %s disconnected; will retry gently", d["name"])
-                    event("bt-disconnected", name=d["name"])
-                    next_try[mac] = time.time() + 60          # give it a minute first
-                if time.time() < next_try.get(mac, 0):
-                    continue
-                if "Echo" in d["name"]:
-                    # Echo devices refuse every Pi-initiated connection (tested with
-                    # both profiles) and drop the pairing if pushed, so only watch
-                    # and remind; the Echo must connect ("Alexa, connect to ...").
-                    next_try[mac] = time.time() + 3600
-                    alert("echo-disconnected", f"{d['name']} isn't connected to the Living "
-                          "Room speaker - say 'Alexa, connect to Living Room Speaker'",
-                          every=12 * 3600)
-                    continue
-                out = sh_out(["bluetoothctl", "connect", mac, A2DP_SOURCE_UUID], timeout=25)
-                ok = "Connected: yes" in sh_out(["bluetoothctl", "info", mac])
-                log.info("bluetooth: reconnect %s -> %s", d["name"],
-                         "ok" if ok else (out.strip().splitlines() or ["refused"])[-1][:80])
-                if not ok:
-                    b = min(backoff.get(mac, 0) + 1, 3)
-                    backoff[mac] = b
-                    next_try[mac] = time.time() + {1: 900, 2: 1800, 3: 3600}[b]
-                    if b == 3:
-                        alert("echo-disconnected", f"{d['name']} is not connected to the "
-                              "Living Room speaker - say 'Alexa, connect to Living Room "
-                              "Speaker'", every=12 * 3600)
-        except Exception as e:
-            log.info("keep_echo_connected error: %s", e)
 
 
 class Follow:
@@ -1254,13 +1153,6 @@ class Follow:
 follow = Follow()
 
 
-def bt_pair_window(secs=120):
-    sh_out(["bluetoothctl", "pairable", "on"])
-    sh_out(["bluetoothctl", "discoverable", "on"])
-    log.info("bluetooth pairing open for %ds", secs)
-    event("bt-pair-open")
-
-
 def receiver_status():
     """(power, input) from the YNC API, or (None, None)."""
     try:
@@ -1333,7 +1225,8 @@ def watchdog():
     """While Spotify is playing on any slot, keep the receiver on our stream.
     Leaves it alone if someone deliberately switched to another input."""
     while True:
-        time.sleep(8)
+        upnp["changed"].wait(8 if not upnp_subscribed() else 30)
+        upnp["changed"].clear()
         try:
             if not any(x.playing for x in slots.slots):
                 continue
@@ -1350,7 +1243,69 @@ def watchdog():
             log.info("watchdog error: %s", e)
 
 
+# ---------------- UPnP eventing (GENA) ----------------
+# The receiver pushes AVTransport changes to /upnp/event, so transport_state()
+# answers from this cache instead of two SOAP polls every few seconds. If the
+# subscription lapses, it falls back to polling.
+UPNP_SUB_S = int(os.environ.get("SPOTCAST_UPNP_SUB_S", "1800"))
+upnp = {"sid": None, "until": 0.0, "callback": None, "state": None, "uri": None,
+        "t": 0.0, "changed": threading.Event()}
+
+
+def upnp_subscribed():
+    return upnp["sid"] is not None and time.time() < upnp["until"]
+
+
+def upnp_notify(body):
+    x = html.unescape(body)                 # LastChange is XML escaped once
+    st = re.search(r'<TransportState val="([^"]*)"', x)
+    uri = re.search(r'<AVTransportURI val="([^"]*)"', x)
+    if st:
+        upnp["state"] = st.group(1)
+    if uri:
+        upnp["uri"] = html.unescape(uri.group(1))
+    if st or uri:
+        upnp["t"] = time.time()
+        _live_cache["t"] = 0.0
+        upnp["changed"].set()
+
+
+def _upnp_subscribe():
+    cb = f"<http://{lan_ip()}:{PORT}/upnp/event>"
+    renew = upnp["sid"] is not None and cb == upnp["callback"]
+    hdrs = ({"SID": upnp["sid"]} if renew else {"CALLBACK": cb, "NT": "upnp:event"})
+    hdrs["TIMEOUT"] = f"Second-{UPNP_SUB_S}"
+    req = urllib.request.Request(f"http://{RECEIVER}:{RECEIVER_UPNP}/AVTransport/event",
+                                 method="SUBSCRIBE", headers=hdrs)
+    _, h = rx_request(req, with_headers=True)
+    sid = h.get("SID") or upnp["sid"]
+    m = re.search(r"Second-(\d+)", h.get("TIMEOUT") or "")
+    secs = int(m.group(1)) if m else UPNP_SUB_S
+    if not renew:
+        log.info("upnp: subscribed to AVTransport events (%ds)", secs)
+        upnp["state"] = upnp["uri"] = None   # initial NOTIFY carries full state
+    upnp.update(sid=sid, callback=cb, until=time.time() + secs)
+    return secs
+
+
+def upnp_events():
+    while True:
+        try:
+            secs = _upnp_subscribe()
+            time.sleep(max(30, secs * 0.8))
+        except ReceiverBackoff:
+            time.sleep(max(1, rx_stats["retry_at"] - time.time()))
+        except Exception as e:
+            if upnp["sid"]:
+                log.info("upnp: subscription lost (%s); resubscribing", e)
+            upnp.update(sid=None, until=0.0)
+            time.sleep(RX_BACKOFF[min(rx_stats["streak"], len(RX_BACKOFF)) - 1]
+                       if rx_stats["streak"] else 5)
+
+
 def transport_state():
+    if upnp_subscribed() and upnp["state"] is not None and upnp["uri"] is not None:
+        return upnp["state"], upnp["uri"]
     try:
         r = soap("AVTransport", "GetTransportInfo", [("InstanceID", 0)])
         s = r.split("<CurrentTransportState>")[1].split("<")[0]
@@ -1408,7 +1363,7 @@ def ensure_playing():
                 '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
                 f'<res protocolInfo="http-get:*:audio/mpeg:*">{STREAM_URL}</res>'
                 '</item></DIDL-Lite>')
-        for attempt in range(6):
+        for attempt in range(len(RX_BACKOFF) + 1):
             try:
                 soap("AVTransport", "SetAVTransportURI",
                      [("InstanceID", 0), ("CurrentURI", html.escape(STREAM_URL)),
@@ -1418,7 +1373,8 @@ def ensure_playing():
                 return
             except Exception as e:
                 log.info("start attempt %d failed: %s", attempt + 1, e)
-                time.sleep(2)   # receiver may still be booting from standby
+                if attempt < len(RX_BACKOFF):  # receiver may still be booting
+                    time.sleep(max(RX_BACKOFF[attempt], rx_stats["retry_at"] - time.time()))
 
 
 def set_volume(spotify_vol):
@@ -1487,13 +1443,8 @@ def api_status():
                      "volume_db": vol, "mute": mute, "max_db": MAX_DB},
         "queue": queue(),
         "follow": follow.status(),
-        "source": ("bluetooth" if health.get("bt_streaming") else
-                   "spotify" if any(x.playing for x in slots.slots) else
+        "source": ("spotify" if any(x.playing for x in slots.slots) else
                    "audio" if time.time() - activity["last_sound"] < 2 else None),
-        "bluetooth": {"devices": bt_devices(),
-                      "discoverable": "Discoverable: yes" in sh_out(["bluetoothctl", "show"]),
-                      "streaming": bool(health.get("bt_streaming")),
-                      "echo_connected": health.get("echo_connected")},
         "sleep_s": max(0, int(sl - time.time())) if sl else 0,
         "update": update_info(),
         "idle_handback_min": IDLE_HANDBACK_MIN,
@@ -1510,6 +1461,8 @@ def api_status():
         "health": {k: health[k] for k in ("stalls", "reconnects", "last_stall",
                                           "soloist_days_left", "started")},
         "stream_url": STREAM_URL,
+        "upnp_events": {"subscribed": upnp_subscribed(), "state": upnp["state"],
+                        "age_s": int(time.time() - upnp["t"]) if upnp["t"] else None},
     }
 
 
@@ -1558,10 +1511,6 @@ class Handler(BaseHTTPRequestHandler):
                 m = float(arg("min") or 0)
                 sleep_timer["until"] = time.time() + m * 60 if m > 0 else None
                 out = {"ok": True}
-            elif p.path == "/api/bt/pair":
-                bt_pair_window(); out = {"ok": True}
-            elif p.path == "/api/bt/forget":
-                sh_out(["bluetoothctl", "remove", arg("mac")]); out = {"ok": True}
             elif p.path == "/api/account/remove":
                 n = int(arg("slot"))
                 sl = next((x for x in slots.slots if x.n == n and x.paired), None)
@@ -1605,6 +1554,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_NOTIFY(self):
+        if urllib.parse.urlparse(self.path).path == "/upnp/event" and                 self.client_address[0] == RECEIVER:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            # the initial NOTIFY can beat the SUBSCRIBE response, so don't
+            # require the SID to be recorded yet; the source IP is checked above
+            upnp_notify(body)
+            self.send_response(200)
+        else:
+            self.send_response(412)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_HEAD(self):
         path = urllib.parse.urlparse(self.path).path
@@ -1731,6 +1693,7 @@ def main():
     log.info("spotcast '%s' -> %s, stream %s", NAME, RECEIVER, STREAM_URL)
     os.makedirs("/var/lib/spotcast", exist_ok=True)
     start_pipeline()
+    threading.Thread(target=upnp_events, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=buffer_tuner, daemon=True).start()
     threading.Thread(target=health_monitor, daemon=True).start()
@@ -1738,8 +1701,7 @@ def main():
     threading.Thread(target=stream_rest, daemon=True).start()
     threading.Thread(target=pin_stream_volumes, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
-    threading.Thread(target=bt_watch, daemon=True).start()
-    threading.Thread(target=keep_echo_connected, daemon=True).start()
+    threading.Thread(target=sound_watch, daemon=True).start()
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:
