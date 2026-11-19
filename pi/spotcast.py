@@ -333,8 +333,19 @@ class Slot:
         self.dir = f"{SLOT_ROOT}/{n}"
         self.port = 9100 + n
         self.proc = None
-        self.playing = False
+        self._playing = False      # from Soloist: playing AND the active device
+        self.sounding = False      # from the mixer: its audio is reaching the receiver
         os.makedirs(self.dir, exist_ok=True)
+
+    # Soloist's active-device flag can stay false while a slot plays (Alexa
+    # follow hand-off), so the audio counts too. Writes set the Soloist side.
+    @property
+    def playing(self):
+        return self._playing or self.sounding
+
+    @playing.setter
+    def playing(self, v):
+        self._playing = bool(v)
 
     @property
     def paired(self):
@@ -484,9 +495,9 @@ class Slot:
                         follow.remote_play(self, uri)
                     # Every device on an account sees that account's playback;
                     # only count it when THIS device is the active output.
-                    was = self.playing
+                    was = self._playing
                     self.playing = (ev.get("status") == "playing") and self.is_active()
-                    if self.playing and not was:
+                    if self._playing and not was:
                         self.mgr.took_over(self)
                     if not self.playing and getattr(self, "pending_rename", False):
                         self.pending_rename = False
@@ -900,6 +911,8 @@ def enforce_single_output():
                 slots.current = sl
         _uncorked.clear(); _uncorked.update(now_uncorked)
         cur = slots.current
+        for sl in by_pid.values():
+            sl.sounding = sl is cur and any(x is sl and live for _, x, live, _ in streams)
         if cur is None or cur.proc is None or cur.proc.poll() is not None:
             return
         for idx, sl, live, block in streams:
