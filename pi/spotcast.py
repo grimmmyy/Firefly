@@ -1358,6 +1358,19 @@ def watchdog():
             if state == "PLAYING" and uri == STREAM_URL:
                 continue
             pw, inp = receiver_status()
+            by_hand = (pw == "Standby" or (pw == "On" and inp not in (None, "PC")))
+            if by_hand and time.time() - _last_takeover[0] > 20:
+                # someone used the remote/front panel: they want it off or on
+                # another source. Pause Spotify rather than take it back.
+                log.info("watchdog: receiver set to %s/%s by hand; pausing Spotify", pw, inp)
+                event("hand-override", power=pw, input=inp)
+                _hand_override[0] = time.time()
+                for x in list(slots.slots):
+                    if x.playing:
+                        x.ctl("pause")
+                        x.playing = False
+                follow.off("receiver changed by hand")
+                continue
             if pw == "On" and inp not in (None, "PC"):
                 continue                     # user picked another source
             log.info("watchdog: receiver %s/%s on %s; restoring stream", pw, inp, state)
@@ -1441,6 +1454,8 @@ def transport_state():
 
 
 ensure_lock = threading.Lock()
+_last_takeover = [0.0]   # when we last powered on / switched the receiver ourselves
+_hand_override = [0.0]   # when someone last turned it off / switched input by hand
 
 
 def refresh_stream_url():
@@ -1456,6 +1471,8 @@ def refresh_stream_url():
 
 
 def ensure_playing():
+    if time.time() - _hand_override[0] < 10:
+        return          # audio still draining after a hand override: don't grab it back
     refresh_stream_url()
     with ensure_lock:
         state, uri = transport_state()
@@ -1468,6 +1485,7 @@ def ensure_playing():
             if inp and inp != "PC":
                 remember_input(inp)
             log.info("taking over receiver (was power=%s input=%s)", pw, inp)
+        _last_takeover[0] = time.time()
         try:  # the RX-V671 renderer only accepts Play while on its "PC" (DLNA) input
             if pw != "On":
                 power_on()
@@ -1664,8 +1682,10 @@ class Handler(BaseHTTPRequestHandler):
                 if cmd not in ("pause", "play", "next", "prev"):
                     raise ValueError("bad cmd")
                 for x in slots.slots:
-                    if x.is_active():
+                    if x.is_active() or (cmd == "pause" and x.playing) or                             (cmd == "play" and x is slots.current):
                         x.ctl(cmd)
+                        if cmd == "pause":
+                            x.playing = False
                 out = {"ok": True}
             else:
                 code, out = 404, {"error": "not found"}

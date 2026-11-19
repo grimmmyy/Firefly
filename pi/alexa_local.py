@@ -8,6 +8,9 @@ Each "light" maps to a receiver action through spotcast's /api:
             dim %   -> receiver volume (0-100% across -80.5 dB .. SPOTCAST_MAX_DB)
   TV Mode   on      -> switch receiver to the TV input
             off     -> back to the Spotify / Bluetooth input (PC)
+  Music     on/off  -> resume / pause Spotify on the receiver
+            (Alexa's own "pause"/"stop" only reach the Echo, which no longer
+            plays once the music has moved to the receiver)
 
 "Alexa, discover devices" once, then: "Alexa, turn on the receiver",
 "Alexa, set the receiver to 40 percent", "Alexa, turn on TV mode".
@@ -103,9 +106,19 @@ def tv_set(on=None, bri=None):
         api("receiver/input", input="PC")
 
 
+def music_get():
+    return {"on": bool(status().get("playing")), "bri": 254}
+
+
+def music_set(on=None, bri=None):
+    if on is not None:
+        api("control", cmd="play" if on else "pause")
+
+
 DEVICES = {
     "1": {"name": "Receiver", "get": receiver_get, "set": receiver_set, "dim": True},
     "2": {"name": "TV Mode", "get": tv_get, "set": tv_set, "dim": False},
+    "3": {"name": "Music", "get": music_get, "set": music_set, "dim": False},
 }
 
 
