@@ -24,7 +24,7 @@ esac
 echo "==> packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  python3 ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 >/dev/null
+  python3 ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 nftables >/dev/null
 
 echo "==> service user"
 id spotcast >/dev/null 2>&1 || useradd -r -m -d /var/lib/spotcast-user -s /usr/sbin/nologin spotcast
@@ -43,6 +43,7 @@ echo "==> files"
 install -d /opt/spotcast /etc/spotcast /var/lib/spotcast
 install -m 755 "$HERE/spotcast.py" /opt/spotcast/spotcast.py
 install -m 755 "$HERE/onevent.sh" /opt/spotcast/onevent.sh
+install -m 755 "$HERE/spotcast-hide.sh" /opt/spotcast/spotcast-hide.sh
 install -m 755 "$HERE/soloist-update" /usr/local/sbin/soloist-update
 sed -i "s#/soloist_release_arm64.tar.gz#/soloist_release_${SOLOIST_ARCH}.tar.gz#" /usr/local/sbin/soloist-update
 install -d -o spotcast /var/lib/spotcast-user/.config/pipewire/pipewire.conf.d

@@ -210,6 +210,7 @@ import json, shutil
 SPARE_NAME = os.environ.get("SPOTCAST_SPARE_NAME", "Living Room - Add me")
 MAX_SLOTS = int(os.environ.get("SPOTCAST_MAX_SLOTS", "6"))
 SLOT_ROOT = "/var/lib/spotcast-user/slots"
+HIDDEN_PROCS = "/sys/fs/cgroup/system.slice/spotcast.service/hidden/cgroup.procs"
 
 
 # ---------------- show "Add me" only when an unregistered device needs it -----------
@@ -421,12 +422,20 @@ class Slot:
     def run(self):
         while True:
             log.info("slot %d starting as '%s'", self.n, self.name())
-            self.proc = subprocess.Popen(
-                ["soloist", "--device-name", self.name(),
+            cmd = ["soloist", "--device-name", self.name(),
                  "--api-key", os.environ["SOLOIST_API_KEY"], "--data-dir", self.dir,
                  "--ws", f"127.0.0.1:{self.port}", "--initial-volume", "100",
-                 "--cache-size", os.environ.get("SPOTCAST_CACHE_MB", "300")],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                   "--cache-size", os.environ.get("SPOTCAST_CACHE_MB", "300")]
+            if self.paired:
+                # Linked account: join the "hidden" cgroup *before* exec, so the
+                # mDNS socket Soloist opens is covered by spotcast-hide.sh's
+                # firewall rule. Fails open (visible) if the cgroup is missing.
+                if not os.access(HIDDEN_PROCS, os.W_OK):
+                    log.info("slot %d: %s not writable; it will be visible on the LAN",
+                             self.n, HIDDEN_PROCS)
+                cmd = ["sh", "-c", 'echo $$ > "$0" 2>/dev/null; exec "$@"', HIDDEN_PROCS] + cmd
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True)
             threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
             threading.Thread(target=self.watch, args=(self.proc,), daemon=True).start()
             if not self.paired:

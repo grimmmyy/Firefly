@@ -9,6 +9,8 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 EnvironmentFile=/etc/spotcast/soloist.env
 Environment=XDG_RUNTIME_DIR=/run/user/997
 Environment=PYTHONUNBUFFERED=1
+Delegate=yes
+ExecStartPre=+/opt/spotcast/spotcast-hide.sh
 ExecStart=/usr/bin/python3 /opt/spotcast/spotcast.py
 Restart=always
 RestartSec=5
