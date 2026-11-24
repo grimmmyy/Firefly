@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
+import 'receiver_sources.dart';
 import 'room_eq_page.dart';
 import 'shell.dart';
 
@@ -119,6 +120,7 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
           const SizedBox(height: 8),
           _nowPlaying(ex),
           _sources(src),
+          _receiverSourcesCard(),
           _soundCard(),
           _scenesCard(),
           _zone2Card(),
@@ -229,6 +231,38 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
       ],
     ]);
   }
+
+  // ---------------------------------------------------------------- receiver's own sources
+  Widget _receiverSourcesCard() => _Section(title: 'On the receiver', children: [
+        TunerCard(app: a),
+        ListTile(
+          leading: const Icon(Icons.usb),
+          title: const Text('USB stick'),
+          subtitle: const Text('Browse and play from the front USB port'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.push(context,
+              MaterialPageRoute(builder: (_) => ReceiverBrowsePage(app: a, source: 'usb'))),
+        ),
+        ListTile(
+          leading: const Icon(Icons.dns_outlined),
+          title: const Text('Media server'),
+          subtitle: const Text('Music shared from a computer or NAS'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.push(context,
+              MaterialPageRoute(builder: (_) => ReceiverBrowsePage(app: a, source: 'server'))),
+        ),
+        ListTile(
+          leading: const Icon(Icons.label_outline),
+          title: const Text('Input names'),
+          subtitle: const Text('e.g. HDMI1 → Fire TV, shown on the receiver's display'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () async {
+            await Navigator.push(
+                context, MaterialPageRoute(builder: (_) => InputNamesPage(app: a)));
+            _reload();
+          },
+        ),
+      ]);
 
   // ---------------------------------------------------------------- sound
   Widget _soundCard() {

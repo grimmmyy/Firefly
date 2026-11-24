@@ -788,6 +788,153 @@ def _b(v):
     return str(v).lower() in ("1", "true", "on", "yes")
 
 
+# ---------------------------------------------------------------- receiver sources
+# The receiver's own FM/AM tuner, its front USB port and its media-server
+# client ("SERVER" input, YNC tag "PC"). Switching to one of them makes the
+# receiver the active source: the Pi's streams are paused.
+RX_SOURCES = {"tuner": ("TUNER", "Tuner"), "usb": ("USB", "USB"), "server": ("SERVER", "PC")}
+
+
+def rx_select(src):
+    inp, _ = RX_SOURCES[src]
+    pw, _ = sc.receiver_status()
+    if pw != "On":
+        sc.power_on()
+        time.sleep(4)
+    put("Main_Zone", f"<Input><Input_Sel>{inp}</Input_Sel></Input>")
+    if st["active"] != "receiver":
+        st["active"], st["since"] = "receiver", time.time()
+        history_add("receiver " + src)
+        threading.Thread(target=_pause_others, args=("receiver",), daemon=True).start()
+
+
+def tuner_state():
+    x = get("Tuner", "<Play_Info>GetParam</Play_Info>") or ""
+    p = get("Tuner", "<Play_Control><Preset><Preset_Sel_Item>GetParam</Preset_Sel_Item>"
+            "</Preset></Play_Control>") or ""
+    band = _tag(x, "Band") or "FM"
+    m = re.search(r"<Current><Val>(\d+)</Val><Exp>(\d)</Exp>", x)
+    freq = int(m.group(1)) / 10 ** int(m.group(2)) if m else None
+    presets = [{"n": int(n), "title": t.split(":", 1)[-1].strip()}
+               for n, t in re.findall(r"<Param>(\d+)</Param><RW>\w+</RW><Title>([^<]*)</Title>", p)]
+    sig = re.search(r"<Tuned>(\w+)</Tuned><Stereo>(\w+)</Stereo>", x)
+    return {"band": band, "freq": freq, "unit": "kHz" if band == "AM" else "MHz",
+            "preset": _tag(x, "Preset_Sel"), "presets": presets,
+            "tuned": bool(sig and sig.group(1) == "Assert"),
+            "stereo": bool(sig and sig.group(2) == "Assert")}
+
+
+def tuner_set(action, value=None, band=None):
+    rx_select("tuner")
+    pc = lambda inner: put("Tuner", f"<Play_Control>{inner}</Play_Control>")
+    if action == "preset":
+        pc(f"<Preset><Preset_Sel>{int(value)}</Preset_Sel></Preset>")
+    elif action == "band":
+        if value not in ("FM", "AM"):
+            raise ValueError("band must be FM or AM")
+        pc(f"<Tuning><Band>{value}</Band></Tuning>")
+    elif action == "freq":
+        band = (band or "FM").upper()
+        if band == "FM":
+            v = round(float(value) * 5) * 20          # 87.5..107.9 MHz, 0.2 steps
+            if not 8750 <= v <= 10790:
+                raise ValueError("FM is 87.5 to 107.9 MHz")
+            f = f"<FM><Val>{v}</Val><Exp>2</Exp><Unit>MHz</Unit></FM>"
+        else:
+            v = round(float(value) / 10) * 10
+            if not 530 <= v <= 1710:
+                raise ValueError("AM is 530 to 1710 kHz")
+            f = f"<AM><Val>{v}</Val><Exp>0</Exp><Unit>kHz</Unit></AM>"
+        pc(f"<Tuning><Band>{band}</Band><Freq>{f}</Freq></Tuning>")
+    elif action in ("scan_up", "scan_down"):
+        b = tuner_state()["band"]
+        d = "Auto Up" if action == "scan_up" else "Auto Down"
+        pc(f"<Tuning><Freq><{b}><Val>{d}</Val></{b}></Freq></Tuning>")
+    elif action != "select":
+        raise ValueError("unknown tuner action")
+    time.sleep(0.5)
+    return tuner_state()
+
+
+def browse_state(src):
+    _, tag = RX_SOURCES[src]
+    cfgx = get(tag, "<Config>GetParam</Config>") or ""
+    li = get(tag, "<List_Info>GetParam</List_Info>") or ""
+    pi = get(tag, "<Play_Info>GetParam</Play_Info>") or ""
+    lines = [{"line": int(n), "text": html.unescape(t), "kind": a}
+             for n, t, a in re.findall(
+                 r"<Line_(\d)><Txt>([^<]*)</Txt><Attribute>([^<]*)</Attribute></Line_\d>", li)
+             if a != "Unselectable"]
+    cur = int(_tag(li, "Current_Line") or 1)
+    mx = int(_tag(li, "Max_Line") or 0)
+    return {"source": src, "ready": _tag(cfgx, "Feature_Availability") == "Ready",
+            "menu": html.unescape(_tag(li, "Menu_Name") or ""),
+            "layer": int(_tag(li, "Menu_Layer") or 1),
+            "busy": _tag(li, "Menu_Status") == "Busy",
+            "lines": lines, "first": cur - (cur - 1) % 8, "total": mx,
+            "playing": _tag(pi, "Playback_Info") == "Play",
+            "artist": html.unescape(_tag(pi, "Artist") or ""),
+            "album": html.unescape(_tag(pi, "Album") or ""),
+            "song": html.unescape(_tag(pi, "Song") or ""),
+            "repeat": _tag(pi, "Repeat"), "shuffle": _tag(pi, "Shuffle")}
+
+
+def browse_do(src, action, value=None):
+    _, tag = RX_SOURCES[src]
+    lc = lambda inner: put(tag, f"<List_Control>{inner}</List_Control>")
+    pc = lambda inner: put(tag, f"<Play_Control>{inner}</Play_Control>")
+    if action == "select_input":
+        rx_select(src)
+    elif action == "open":                      # a line on the current page, 1..8
+        rx_select(src)
+        lc(f"<Direct_Sel>Line_{max(1, min(8, int(value)))}</Direct_Sel>")
+    elif action == "back":
+        lc("<Cursor>Back</Cursor>")
+    elif action == "home":
+        lc("<Cursor>Back to Home</Cursor>")
+    elif action == "page":                      # first line of the wanted page
+        lc(f"<Jump_Line>{max(1, int(value))}</Jump_Line>")
+    elif action in ("Play", "Stop", "Pause", "Skip Fwd", "Skip Rev"):
+        pc(f"<Playback>{action}</Playback>")
+    elif action == "repeat" and value in ("Off", "Single", "All"):
+        pc(f"<Play_Mode><Repeat>{value}</Repeat></Play_Mode>")
+    elif action == "shuffle" and value in ("Off", "On"):
+        pc(f"<Play_Mode><Shuffle>{value}</Shuffle></Play_Mode>")
+    else:
+        raise ValueError("unknown browse action")
+    for _ in range(10):                         # the receiver answers "Busy" while it reads
+        time.sleep(0.4)
+        s = browse_state(src)
+        if not s["busy"]:
+            return s
+    return s
+
+
+INPUT_TAGS = {"HDMI1": "HDMI_1", "HDMI2": "HDMI_2", "HDMI3": "HDMI_3", "HDMI4": "HDMI_4",
+              "HDMI5": "HDMI_5", "AV1": "AV_1", "AV2": "AV_2", "AV3": "AV_3", "AV4": "AV_4",
+              "AV5": "AV_5", "AV6": "AV_6", "V-AUX": "V_AUX", "AUDIO1": "AUDIO_1",
+              "AUDIO2": "AUDIO_2", "DOCK": "DOCK", "USB": "USB"}
+
+
+def input_names():
+    x = sc.ync('<YAMAHA_AV cmd="GET"><System><Input_Output><Input_Name>GetParam'
+               '</Input_Name></Input_Output></System></YAMAHA_AV>') or ""
+    return [{"id": i, "name": html.unescape(_tag(x, t) or i)} for i, t in INPUT_TAGS.items()]
+
+
+def rename_input(inp, name):
+    t = INPUT_TAGS.get(inp)
+    if not t:
+        raise ValueError("this input can't be renamed")
+    name = (name or "").strip()[:9] or inp            # the display holds 9 characters
+    if not re.fullmatch(r"[ -~]+", name):
+        raise ValueError("use plain letters, numbers and symbols")
+    sc.ync(f'<YAMAHA_AV cmd="PUT"><System><Input_Output><Input_Name><{t}>{html.escape(name)}'
+           f'</{t}></Input_Name></Input_Output></System></YAMAHA_AV>')
+    _inputs["t"] = 0                                  # input list carries the titles
+    return input_names()
+
+
 def api(path, arg, body=None):
     """/api/x/... ; arg(k) reads the query string, body is parsed JSON (POST)."""
     p = path[len("/api/x/"):]
@@ -799,6 +946,18 @@ def api(path, arg, body=None):
         return sound_state()
     if p == "inputs":
         return {"inputs": inputs()}
+    if p == "input_names":
+        if arg("id"):
+            return {"inputs": rename_input(arg("id"), arg("name"))}
+        return {"inputs": input_names()}
+    if p == "tuner":
+        if arg("action"):
+            return tuner_set(arg("action"), arg("value"), arg("band"))
+        return tuner_state()
+    if p in ("usb", "server"):
+        if arg("action"):
+            return browse_do(p, arg("action"), arg("value"))
+        return browse_state(p)
     if p == "zone2":
         if any(arg(k) for k in ("power", "input", "volume_db", "mute")):
             zone2_set(power=arg("power") or None, input=arg("input") or None,
