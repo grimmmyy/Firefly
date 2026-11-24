@@ -40,6 +40,7 @@ class SsdpDiscovery {
   /// Discover renderers within [timeout]. Deduplicated by device description URL.
   Future<List<Renderer>> discover({
     Duration timeout = const Duration(seconds: 5),
+    bool sweep = false,
   }) async {
     final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     socket.readEventsEnabled = true;
@@ -81,16 +82,27 @@ class SsdpDiscovery {
     // iOS blocks multicast without Apple's restricted entitlement, and Android
     // often drops replies, so also try known/likely description URLs directly.
     locations.addAll(extraLocations);
-    locations.addAll(await _sweepSubnet());
 
     final renderers = <Renderer>[];
-    for (final loc in locations) {
-      try {
-        final r = await _describe(Uri.parse(loc));
-        if (r != null) renderers.add(r);
-      } catch (_) {
-        // Ignore devices that fail to describe; they won't be usable anyway.
+    Future<void> describeAll(Iterable<String> locs) async {
+      for (final loc in locs) {
+        try {
+          final r = await _describe(Uri.parse(loc));
+          if (r != null) renderers.add(r);
+        } catch (_) {
+          // Ignore devices that fail to describe; they won't be usable anyway.
+        }
       }
+    }
+
+    await describeAll(locations);
+    // The subnet sweep opens a bare TCP connection to every host's renderer
+    // port and drops it without a request. The RX-V671's 2011 network stack
+    // is suspected of wedging on that, so it is a last resort: only when
+    // nothing was found the normal way, or when asked for explicitly.
+    if (renderers.isEmpty || sweep) {
+      final more = (await _sweepSubnet()).difference(locations);
+      await describeAll(more);
     }
     // Deduplicate by friendlyName+host.
     final seen = <String>{};
