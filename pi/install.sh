@@ -108,3 +108,9 @@ install -m 644 "$HERE/firefly-dl-sync.service" "$HERE/firefly-dl-sync.timer" /et
 install -m 755 "$HERE/firefly-dl-sync.sh" /opt/spotcast/
 systemctl daemon-reload
 systemctl enable --now firefly-dl-sync.timer
+
+# Nightly settings snapshot (14 days, /var/backups/spotcast; excludes the Soloist key).
+install -m 755 "$HERE/spotcast-backup.sh" /opt/spotcast/
+install -m 644 "$HERE/spotcast-backup.service" "$HERE/spotcast-backup.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now spotcast-backup.timer

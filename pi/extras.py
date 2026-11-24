@@ -979,7 +979,8 @@ def tuner_set(action, value=None, band=None):
     elif action == "freq":
         band = (band or "FM").upper()
         if band == "FM":
-            v = round(float(value) * 5) * 20          # 87.5..107.9 MHz, 0.2 steps
+            # 87.5..107.9 MHz in 0.2 MHz steps from 87.5 (US channels end in odd tenths)
+            v = 8750 + round((float(value) * 100 - 8750) / 20) * 20
             if not 8750 <= v <= 10790:
                 raise ValueError("FM is 87.5 to 107.9 MHz")
             f = f"<FM><Val>{v}</Val><Exp>2</Exp><Unit>MHz</Unit></FM>"
