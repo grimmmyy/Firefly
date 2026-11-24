@@ -96,3 +96,9 @@ echo
 echo "Done. In Spotify (on the same Wi-Fi), pick \"Living Room - Add me\" to link your account."
 echo "Status page + app pairing code: http://$(hostname -I | awk '{print $1}'):8090"
 [ -n "$RECEIVER_IP" ] || echo "(The receiver is found automatically; see the status page to confirm.)"
+
+# The Pi sits on the LAN twice (eth0 + wlan0). Default Linux ARP lets each
+# interface answer for the other's address ("ARP flux"); stop that so the
+# receiver's 2011 network stack always sees one MAC per address.
+printf 'net.ipv4.conf.all.arp_ignore=1\nnet.ipv4.conf.all.arp_announce=2\nnet.ipv4.conf.default.arp_ignore=1\nnet.ipv4.conf.default.arp_announce=2\n' > /etc/sysctl.d/90-arp-flux.conf
+sysctl -q -p /etc/sysctl.d/90-arp-flux.conf
