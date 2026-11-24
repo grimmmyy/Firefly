@@ -271,9 +271,28 @@ class _HealthStrip extends StatelessWidget {
       'download-failed' => 'Update check failed ${fmtAgo(upd['checked'])}',
       _ => 'Auto-updates daily',
     };
+    final frozen = s.health['receiver_ok'] == false;
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Wrap(spacing: 8, runSpacing: 8, children: [
+        if (frozen)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.redAccent.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.redAccent),
+            ),
+            child: const Row(children: [
+              Icon(Icons.power_off, color: Colors.redAccent),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text('The receiver's network control is frozen. Unplug it from the '
+                    'wall for 30 seconds, then plug it back in.'),
+              ),
+            ]),
+          ),
         StatusPill(buf == null ? 'Delay –' : 'Delay ${((buf as num) * 1000).round() + ((q ?? 0) as num).round()} ms',
             color: Colors.lightBlueAccent),
         StatusPill(stalls == 0 ? 'No dropouts' : '$stalls dropouts',

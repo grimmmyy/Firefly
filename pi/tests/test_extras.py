@@ -97,6 +97,7 @@ class Base(unittest.TestCase):
         extras.st["sleep_until"] = 0
         bridge.rx_stats["quiet_until"] = 0
         extras._sound_cache.clear()
+        extras._tuner_cache.update(t=0.0, v=None)
         extras.time.sleep = lambda s: None  # no real waiting
 
 
@@ -173,6 +174,12 @@ class Tuner(Base):
         bridge.input = "TUNER"
         extras.tuner_set("preset", "1")
         self.assertFalse(any("Input_Sel" in x for x in puts()))
+
+
+class TunerCache(Tuner):
+    def test_repeated_reads_hit_the_receiver_once(self):
+        extras.tuner_state(); extras.tuner_state(); extras.tuner_state()
+        self.assertEqual(len([x for x in bridge.sent if "<Tuner>" in x]), 2)  # info + presets
 
 
 class Browse(Base):

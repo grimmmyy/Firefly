@@ -699,8 +699,15 @@ slots = SlotManager()
 # requests. Every call to it goes through this gate: one at a time, with a
 # minimum gap between requests.
 RX_GATE = threading.Lock()
-RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.12"))
+RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.25"))
 _rx_last = [0.0]
+# After a "heavy" command (power, input switch, receiver scene) the receiver
+# reconfigures its audio path; the next request waits this long. Unlike the
+# sound-change quiet window this only delays, so multi-step sequences
+# (power on -> input -> SetAVTransportURI -> Play) still complete.
+RX_SETTLE_S = float(os.environ.get("SPOTCAST_RX_SETTLE_S", "3"))
+_HEAVY = (b"<Input_Sel>", b"<Power>On", b"<Power>Standby", b"<Scene_Load>")
+_rx_settle = [0.0]
 
 
 rx_stats = {"ok": 0, "fail": 0, "first_fail": None, "last_ok": None, "log": [],
@@ -799,7 +806,8 @@ def rx_request(req, timeout=5, with_headers=False):
             # 2026-11-24). Nothing is sent until it has settled.
             raise ReceiverBackoff(f"receiver applying a sound change, "
                                   f"{rx_stats['quiet_until'] - time.time():.0f}s")
-        wait = RX_MIN_GAP - (time.monotonic() - _rx_last[0])
+        wait = max(RX_MIN_GAP - (time.monotonic() - _rx_last[0]),
+                   _rx_settle[0] - time.monotonic())
         if wait > 0:
             time.sleep(wait)
         what = (req.full_url.rsplit("/", 2)[-2] + ":" +
@@ -811,6 +819,8 @@ def rx_request(req, timeout=5, with_headers=False):
             body, hdrs = _rx_send(u.port or 80, u.path, req.data, dict(req.header_items()),
                                   timeout, req.get_method())
             rx_latency_add(time.monotonic() - t0)
+            if req.data and any(h in req.data for h in _HEAVY):
+                _rx_settle[0] = time.monotonic() + RX_SETTLE_S
             rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
             if rx_stats["first_fail"]:
                 log.info("receiver control recovered after %ds down",
@@ -950,13 +960,15 @@ def health_monitor():
         if pw is None:
             if health["receiver_fail_since"] is None:
                 health["receiver_fail_since"] = time.time()
-            elif time.time() - health["receiver_fail_since"] > 300 and health["receiver_ok"]:
+            # two failed checks in a row (about a minute); a sound-change quiet
+            # window lasts 30 s, so it never trips this
+            elif time.time() - health["receiver_fail_since"] > 50 and health["receiver_ok"]:
                 health["receiver_ok"] = False
                 frozen = sh_out(["ping", "-c1", "-W1", RECEIVER]).find(" 0% packet loss") >= 0
                 alert("receiver-down",
                       "Receiver (RX-V671) answers ping but its network control is frozen - "
                       "unplug it from the wall for 30 s" if frozen else
-                      "Receiver (RX-V671) unreachable for 5 minutes - "
+                      "Receiver (RX-V671) unreachable for a minute - "
                       "check its power and network cable")
         else:
             if not health["receiver_ok"]:
@@ -1357,7 +1369,7 @@ def position_seconds():
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) if m else None
 
 
-def measure_buffer(seconds=7):
+def measure_buffer(seconds=6):
     """Receiver buffer = audio sent since connect - receiver's played position,
     sampled exactly at each RelTime tick (RelTime has 1 s resolution)."""
     t0 = tune["t0"]
@@ -1372,7 +1384,7 @@ def measure_buffer(seconds=7):
         if rt is not None and last is not None and rt > last:
             ests.append((time.time() - t0 - tune["drained"]) - rt)
         last = rt
-        time.sleep(0.2)                  # gentle on the receiver (was 30 ms)
+        time.sleep(0.4)                  # ~15 requests per measurement (was 0.2 s / 35)
     ests = ests[1:] or ests
     # each tick is detected up to one poll interval late, which only ever
     # inflates the estimate, so the smallest sample is the most accurate
@@ -1400,7 +1412,7 @@ def buffer_tuner():
                          tune["drain_left"])
                 next_check = time.time() + 20
             else:
-                next_check = time.time() + 300
+                next_check = time.time() + 900          # every 15 min once settled
         except Exception as e:
             log.info("tuner error: %s", e)
             time.sleep(10)
@@ -1410,7 +1422,7 @@ def watchdog():
     """While Spotify is playing on any slot, keep the receiver on our stream.
     Leaves it alone if someone deliberately switched to another input."""
     while True:
-        upnp["changed"].wait(8 if not upnp_subscribed() else 30)
+        upnp["changed"].wait(15 if not upnp_subscribed() else 30)
         upnp["changed"].clear()
         try:
             if not any(x.playing for x in slots.slots):
@@ -1540,14 +1552,23 @@ def upnp_events():
                        if rx_stats["streak"] else 5)
 
 
+_media_cache = {"state": None, "uri": "", "t": 0.0}
+
+
 def transport_state():
     if upnp_subscribed() and upnp["state"] is not None and upnp["uri"] is not None:
         return upnp["state"], upnp["uri"]
     try:
         r = soap("AVTransport", "GetTransportInfo", [("InstanceID", 0)])
         s = r.split("<CurrentTransportState>")[1].split("<")[0]
+        # the loaded URI only changes when something new is played; while the
+        # receiver keeps PLAYING, reuse it for a minute (halves the UPnP traffic)
+        c = _media_cache
+        if s == "PLAYING" and c["state"] == "PLAYING" and time.time() - c["t"] < 60:
+            return s, c["uri"]
         m = soap("AVTransport", "GetMediaInfo", [("InstanceID", 0)])
         uri = html.unescape(m.split("<CurrentURI>")[1].split("<")[0]) if "<CurrentURI>" in m else ""
+        c.update(state=s, uri=uri, t=time.time())
         return s, uri
     except Exception as e:
         log.info("transport query failed: %s", e)
@@ -1607,6 +1628,7 @@ def ensure_playing():
                 '</item></DIDL-Lite>')
         for attempt in range(len(RX_BACKOFF) + 1):
             try:
+                _media_cache["t"] = 0.0                 # new URI: re-read it next time
                 soap("AVTransport", "SetAVTransportURI",
                      [("InstanceID", 0), ("CurrentURI", html.escape(STREAM_URL)),
                       ("CurrentURIMetaData", "")])
@@ -1701,8 +1723,11 @@ def api_status():
                     "unknown": devices.unknown},
         "latency": {"receiver_buffer_s": tune["last"], "target_s": BUF["target"],
                     "pi_queue_ms": pi_buffer_ms()},
-        "health": {k: health[k] for k in ("stalls", "reconnects", "last_stall",
-                                          "soloist_days_left", "started")},
+        "health": {**{k: health[k] for k in ("stalls", "reconnects", "last_stall",
+                                             "soloist_days_left", "started")},
+                   "receiver_ok": health["receiver_ok"],
+                   "receiver_down_s": int(time.time() - health["receiver_fail_since"])
+                   if health["receiver_fail_since"] else 0},
         "stream_url": STREAM_URL,
         "tailscale_ip": tailscale_ip(),
         "alerts": {"ntfy": bool(NTFY_TOPIC), "discord": bool(DISCORD_WEBHOOK),

@@ -1029,7 +1029,19 @@ def rx_select(src):
         put("Main_Zone", f"<Input><Input_Sel>{inp}</Input_Sel></Input>")
 
 
-def tuner_state():
+_tuner_cache = {"t": 0.0, "v": None}
+
+
+def tuner_state(max_age=30.0):
+    """Tuner status, shared for max_age s (Alexa asks for it on every refresh)."""
+    c = _tuner_cache
+    if c["v"] is not None and time.time() - c["t"] < max_age:
+        return c["v"]
+    c["v"], c["t"] = _tuner_state(), time.time()
+    return c["v"]
+
+
+def _tuner_state():
     x = get("Tuner", "<Play_Info>GetParam</Play_Info>") or ""
     p = get("Tuner", "<Play_Control><Preset><Preset_Sel_Item>GetParam</Preset_Sel_Item>"
             "</Preset></Play_Control>") or ""
@@ -1069,13 +1081,13 @@ def tuner_set(action, value=None, band=None):
             f = f"<AM><Val>{v}</Val><Exp>0</Exp><Unit>kHz</Unit></AM>"
         pc(f"<Tuning><Band>{band}</Band><Freq>{f}</Freq></Tuning>")
     elif action in ("scan_up", "scan_down"):
-        b = tuner_state()["band"]
+        b = tuner_state(max_age=0)["band"]
         d = "Auto Up" if action == "scan_up" else "Auto Down"
         pc(f"<Tuning><Freq><{b}><Val>{d}</Val></{b}></Freq></Tuning>")
     elif action != "select":
         raise ValueError("unknown tuner action")
     time.sleep(0.5)
-    return tuner_state()
+    return tuner_state(max_age=0)
 
 
 def _meta(xml, name):
