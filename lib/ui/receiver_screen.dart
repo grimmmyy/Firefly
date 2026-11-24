@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
+import 'receiver_automations.dart';
 import 'receiver_sources.dart';
 import 'room_eq_page.dart';
 import 'shell.dart';
@@ -123,6 +124,7 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
           _receiverSourcesCard(),
           _soundCard(),
           _scenesCard(),
+          _Section(title: 'Automations', children: [AutomationsCard(app: a)]),
           _zone2Card(),
           _dspCard(dsp),
           _schedulesCard(),
@@ -643,7 +645,8 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
           ListTile(
             leading: Icon(switch (schedules[i]['action']) {
               'wake' => Icons.alarm,
-              'off' => Icons.bedtime_outlined,
+              'off' => Icons.power_settings_new,
+              'sleep' => Icons.bedtime_outlined,
               _ => Icons.auto_awesome,
             }),
             title: Text('${schedules[i]['time']} · ${_schedTitle(schedules[i])}'),
@@ -678,8 +681,9 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
       ]);
 
   String _schedTitle(Map s) => switch (s['action']) {
-        'wake' => 'Wake up with ${s['radio_name'] ?? (s['radio'] != null ? 'radio' : 'Spotify')}',
+        'wake' => 'Wake up with ${s['tuner_preset'] != null ? 'FM preset ${s['tuner_preset']}' : s['radio_name'] ?? (s['radio'] != null ? 'radio' : 'Spotify')}',
         'off' => 'Turn off',
+        'sleep' => 'Fade out over ${s['fade_min'] ?? 20} min',
         _ => 'Scene: ${s['scene']}',
       };
 
@@ -699,6 +703,11 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
     String? scene = s['scene'] as String? ?? (scenes.isEmpty ? null : '${scenes.first['name']}');
     final radio = TextEditingController(text: '${s['radio'] ?? ''}');
     final radioName = TextEditingController(text: '${s['radio_name'] ?? ''}');
+    String wakeSrc = s['tuner_preset'] != null
+        ? 'fm'
+        : (s['radio'] != null ? 'stream' : 'spotify');
+    final presetCtl = TextEditingController(text: '${s['tuner_preset'] ?? 1}');
+    double fade = ((s['fade_min'] as num?) ?? (action == 'sleep' ? 20 : 10)).toDouble();
     return showDialog<Map>(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -709,6 +718,7 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
               SegmentedButton<String>(
                 segments: const [
                   ButtonSegment(value: 'wake', label: Text('Wake')),
+                  ButtonSegment(value: 'sleep', label: Text('Sleep')),
                   ButtonSegment(value: 'scene', label: Text('Scene')),
                   ButtonSegment(value: 'off', label: Text('Off')),
                 ],
@@ -735,19 +745,47 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
               ]),
               if (action == 'wake') ...[
                 const SizedBox(height: 8),
-                Text('Volume ${vol.toStringAsFixed(1)} dB (fades up over a minute)'),
+                Text('Volume ${vol.toStringAsFixed(1)} dB'),
                 Slider(
                     min: -80,
                     max: a.spot.maxDb,
                     value: vol.clamp(-80, a.spot.maxDb),
                     onChanged: (v) => set(() => vol = v)),
-                TextField(
-                    controller: radio,
-                    decoration: const InputDecoration(
-                        labelText: 'Radio stream URL (empty = resume Spotify)')),
-                TextField(
-                    controller: radioName,
-                    decoration: const InputDecoration(labelText: 'Station name')),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'spotify', label: Text('Spotify')),
+                    ButtonSegment(value: 'fm', label: Text('FM/AM')),
+                    ButtonSegment(value: 'stream', label: Text('Stream')),
+                  ],
+                  selected: {wakeSrc},
+                  onSelectionChanged: (v) => set(() => wakeSrc = v.first),
+                ),
+                if (wakeSrc == 'fm')
+                  TextField(
+                    controller: presetCtl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Receiver preset number'),
+                  ),
+                if (wakeSrc == 'stream') ...[
+                  TextField(
+                      controller: radio,
+                      decoration: const InputDecoration(labelText: 'Radio stream URL')),
+                  TextField(
+                      controller: radioName,
+                      decoration: const InputDecoration(labelText: 'Station name')),
+                ],
+              ],
+              if (action == 'wake' || action == 'sleep') ...[
+                const SizedBox(height: 8),
+                Text(action == 'wake'
+                    ? 'Fade up over ${fade.round()} min'
+                    : 'Fade out over ${fade.round()} min, then standby'),
+                Slider(
+                    min: 1,
+                    max: 60,
+                    divisions: 59,
+                    value: fade.clamp(1, 60),
+                    onChanged: (v) => set(() => fade = v)),
               ],
               if (action == 'scene')
                 DropdownButtonFormField<String>(
@@ -774,10 +812,13 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
                             '${time.minute.toString().padLeft(2, '0')}',
                         'days': (days.toList()..sort()),
                         if (action == 'wake') 'volume_db': double.parse(vol.toStringAsFixed(1)),
-                        if (action == 'wake' && radio.text.trim().isNotEmpty)
+                        if (action == 'wake' && wakeSrc == 'stream' && radio.text.trim().isNotEmpty)
                           'radio': radio.text.trim(),
-                        if (action == 'wake' && radioName.text.trim().isNotEmpty)
+                        if (action == 'wake' && wakeSrc == 'stream' && radioName.text.trim().isNotEmpty)
                           'radio_name': radioName.text.trim(),
+                        if (action == 'wake' && wakeSrc == 'fm')
+                          'tuner_preset': int.tryParse(presetCtl.text.trim()) ?? 1,
+                        if (action == 'wake' || action == 'sleep') 'fade_min': fade.round(),
                         if (action == 'scene') 'scene': scene,
                       }),
               child: const Text('Save'),

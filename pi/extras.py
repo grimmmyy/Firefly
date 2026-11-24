@@ -51,12 +51,24 @@ DEFAULTS = {
     ],
     "schedules": [],
     "dlna_uuid": None,
+    # sound settings applied when a source becomes active (keys as in set_sound);
+    # Pi sources by name, receiver inputs by their id (HDMI1, TUNER, ...)
+    "source_sound_on": False,
+    "source_sound": {
+        "spotify": {"straight": True, "enhancer": True},
+        "airplay": {"straight": True, "enhancer": True},
+        "bluetooth": {"straight": True, "enhancer": True},
+        "radio": {"straight": True, "enhancer": True},
+        "HDMI1": {"program": "Standard"},
+    },
+    # volume cap during quiet hours (receiver remote included)
+    "quiet": {"on": False, "from": "22:00", "to": "07:00", "max_db": -40.0},
 }
 
 cfg = {}
 _lock = threading.Lock()
 st = {"active": None, "since": 0.0, "live": set(), "airplay_meta": {}, "radio": None,
-      "bt_pair_until": 0.0, "fired": {}}
+      "bt_pair_until": 0.0, "fired": {}, "fade": None, "sleep_until": 0.0}
 _procs = {}
 
 
@@ -664,22 +676,121 @@ def run_schedule(s):
         if sc_:
             apply_scene(sc_)
     elif a == "wake":
-        if s.get("volume_db") is not None:
-            # start quiet and ramp up over a minute
-            target = float(s["volume_db"])
-            sc.set_receiver_volume(target - 15)
-        if s.get("radio"):
+        # Source: an FM/AM preset or frequency, an internet radio stream, or
+        # Spotify. Volume fades up from very quiet over fade_min minutes.
+        target = float(s.get("volume_db", -40))
+        start = target - 25
+        st["fade"] = None                              # cancels a running fade
+        pw, _ = sc.receiver_status()
+        if pw != "On":
+            sc.power_on()
+            time.sleep(4)
+        sc.set_receiver_volume(start)
+        if s.get("tuner_preset") or s.get("tuner_freq"):
+            if s.get("tuner_preset"):
+                tuner_set("preset", s["tuner_preset"])
+            else:
+                tuner_set("freq", s["tuner_freq"], s.get("tuner_band", "FM"))
+        elif s.get("radio"):
             radio_play(s["radio"], s.get("radio_name", ""))
         else:
             cur = sc.slots.current
             if cur:
                 cur.ctl("play")
-        if s.get("volume_db") is not None:
-            def ramp():
-                for i in range(1, 16):
-                    time.sleep(4)
-                    sc.set_receiver_volume(target - 15 + i)
-            threading.Thread(target=ramp, daemon=True).start()
+        fade_volume(start, target, float(s.get("fade_min", 10)))
+    elif a == "sleep":
+        sleep_fade(float(s.get("fade_min", 20)))
+
+
+def fade_volume(start, target, minutes, then=None):
+    """Move the receiver volume start->target in 0.5 dB steps over `minutes`.
+    A newer fade (or sleep_cancel) stops this one."""
+    token = object()
+    st["fade"] = token
+    steps = max(1, int(abs(target - start) * 2))
+    gap = max(2.0, minutes * 60 / steps)          # at least 2 s between requests
+
+    def run():
+        for i in range(1, steps + 1):
+            time.sleep(gap)
+            if st["fade"] is not token:
+                return
+            try:
+                sc.set_receiver_volume(start + (target - start) * i / steps)
+            except Exception as e:
+                log.info("fade: %s", e)
+        if st["fade"] is token:
+            st["fade"] = None
+            if then:
+                then()
+    threading.Thread(target=run, daemon=True).start()
+
+
+def sleep_fade(minutes):
+    """Fade to silence over `minutes`, then pause everything and go to standby."""
+    cur, _ = sc.receiver_volume()
+    if cur is None:
+        return
+
+    def done():
+        _pause_others("none")
+        sc.hand_back_now()
+        put("Main_Zone", "<Power_Control><Power>Standby</Power></Power_Control>")
+        time.sleep(3)
+        sc.set_receiver_volume(cur)                 # next time starts at the old level
+    st["sleep_until"] = time.time() + minutes * 60
+    fade_volume(cur, max(-80.0, cur - 30), minutes, then=done)
+    log.info("sleep: fading out over %.0f min", minutes)
+
+
+def sleep_cancel():
+    st["fade"] = None
+    st["sleep_until"] = 0
+
+
+# ---------------------------------------------------------------- automations
+def _in_window(frm, to, now_hm):
+    return frm <= now_hm < to if frm <= to else (now_hm >= frm or now_hm < to)
+
+
+def automations():
+    """Quiet-hours volume cap and per-source sound, checked every 20 s from
+    the receiver status spotcast already polls (no extra receiver traffic
+    beyond a PUT when something has to change)."""
+    last_src = None
+    while True:
+        time.sleep(20)
+        try:
+            pw, inp = sc.receiver_status()
+            if pw != "On":
+                last_src = None
+                continue
+            q = cfg.get("quiet") or {}
+            if q.get("on") and _in_window(q.get("from", "22:00"), q.get("to", "07:00"),
+                                          time.strftime("%H:%M")):
+                vol, _ = sc.receiver_volume()
+                cap = float(q.get("max_db", -40))
+                if vol is not None and vol > cap and not st.get("fade"):
+                    sc.set_receiver_volume(cap)
+                    log.info("quiet hours: volume %.1f capped to %.1f", vol, cap)
+            # the source that is heard: a Pi source when the receiver is on PC,
+            # otherwise the receiver input itself
+            src = (st["active"] or "spotify") if inp == "PC" else inp
+            if src != last_src:
+                last_src = src
+                prof = (cfg.get("source_sound") or {}).get(src)
+                if cfg.get("source_sound_on") and prof:
+                    log.info("source sound: %s -> %s", src, prof)
+                    if prof.get("straight"):
+                        set_sound("straight", True)
+                    elif prof.get("program"):
+                        set_sound("program", prof["program"])
+                    for k in ("enhancer", "drc", "pure_direct", "cinema_3d",
+                              "dialogue_lift", "bass", "treble"):
+                        if prof.get(k) is not None:
+                            set_sound(k, prof[k])
+        except Exception as e:
+            log.info("automations: %s", e)
 
 
 def scheduler():
@@ -1028,8 +1139,8 @@ def api(path, arg, body=None):
                 s.setdefault("id", uuid.uuid4().hex[:8])
                 if not re.fullmatch(r"\d\d:\d\d", s.get("time", "")):
                     raise ValueError("time must be HH:MM")
-                if s.get("action") not in ("wake", "off", "scene"):
-                    raise ValueError("action must be wake/off/scene")
+                if s.get("action") not in ("wake", "off", "scene", "sleep"):
+                    raise ValueError("action must be wake/off/scene/sleep")
             cfg["schedules"] = body
             save()
         if arg("run"):
@@ -1039,6 +1150,73 @@ def api(path, arg, body=None):
         return {"schedules": cfg["schedules"]}
     if p == "history":
         return history(int(arg("days") or 7))
+    if p == "sleep":                         # ?minutes=20 starts, ?cancel=1 stops
+        if arg("cancel"):
+            sleep_cancel()
+        elif arg("minutes"):
+            sleep_fade(max(1.0, min(120.0, float(arg("minutes")))))
+        return {"sleep_s": max(0, int(st["sleep_until"] - time.time()))}
+    if p == "fade":                          # ?to=-35&minutes=1 (volume_db)
+        cur, _ = sc.receiver_volume()
+        if cur is None:
+            raise ValueError("receiver not answering")
+        fade_volume(cur, float(arg("to")), float(arg("minutes") or 1))
+        return {"from": cur, "to": float(arg("to"))}
+    if p == "quiet":
+        if body is not None:
+            q = {**cfg["quiet"], **body}
+            for k in ("from", "to"):
+                if not re.fullmatch(r"\d\d:\d\d", q[k]):
+                    raise ValueError("time must be HH:MM")
+            q["max_db"] = max(-80.0, min(sc.MAX_DB, float(q["max_db"])))
+            q["on"] = bool(q["on"])
+            cfg["quiet"] = q
+            save()
+        return cfg["quiet"]
+    if p == "source_sound":
+        if body is not None:
+            if "on" in body:
+                cfg["source_sound_on"] = bool(body["on"])
+            if isinstance(body.get("profiles"), dict):
+                cfg["source_sound"] = body["profiles"]
+            save()
+        return {"on": cfg["source_sound_on"], "profiles": cfg["source_sound"],
+                "programs": SOUND_PROGRAMS}
+    if p == "quick":                         # Android tile / home-screen widget
+        d = arg("do")
+        if d == "power":
+            pw, _ = sc.receiver_status()
+            if pw == "On":
+                put("Main_Zone", "<Power_Control><Power>Standby</Power></Power_Control>")
+            else:
+                sc.power_on()
+        elif d in ("vol_up", "vol_down"):
+            cur, _ = sc.receiver_volume()
+            if cur is not None:
+                sc.set_receiver_volume(cur + (2 if d == "vol_up" else -2))
+        elif d == "night":
+            set_sound("drc", not sound_state()["drc"])
+        elif d == "mute":
+            _, m = sc.receiver_volume()
+            put("Main_Zone", f"<Volume><Mute>{'Off' if m else 'On'}</Mute></Volume>")
+        sc.invalidate_basic()
+        pw, inp = sc.receiver_status()
+        vol, mute = sc.receiver_volume()
+        return {"power": pw, "input": inp, "volume_db": vol, "mute": mute,
+                "night": sound_state()["drc"]}
+    if p == "duck":                          # phone call: ?on=1 lowers, ?on=0 restores
+        cur, _ = sc.receiver_volume()
+        if _b(arg("on")):
+            if st.get("duck_from") is None and cur is not None:
+                st["duck_from"], st["fade"] = cur, None
+                sc.set_receiver_volume(max(-80.0, cur - float(arg("db") or 20)))
+        elif st.get("duck_from") is not None:
+            back, st["duck_from"] = st["duck_from"], None
+            sc.set_receiver_volume(back)            # restore in one step
+        return {"ducked": st.get("duck_from") is not None}
+    if p == "health":
+        return {"latency": sc.rx_latency_report(), "rx_ok": sc.rx_stats["ok"],
+                "rx_fail": sc.rx_stats["fail"]}
     raise KeyError(p)
 
 
@@ -1071,7 +1249,7 @@ def start():
     except Exception as e:
         log.info("dsp: %s", e)
     sync_sources()
-    for f in (arbiter, airplay_meta_reader, bt_watch, scheduler):
+    for f in (arbiter, airplay_meta_reader, bt_watch, scheduler, automations):
         threading.Thread(target=f, daemon=True, name=f.__name__).start()
     log.info("extras: airplay=%s (AirPlay 2: %s) dlna=%s bluetooth=%s",
              cfg["airplay"], airplay2(), cfg["dlna"], cfg["bluetooth"])

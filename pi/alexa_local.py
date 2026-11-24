@@ -149,6 +149,75 @@ def zone2_set(on=None, bri=None):
         api("x/zone2", volume_db=f"{-80.5 + bri / 254 * 70.5:.1f}")
 
 
+def _x(path, **q):
+    try:
+        return api(path, **q) or {}
+    except Exception:
+        return {}
+
+
+def _rx_input():
+    return status().get("receiver", {}).get("input")
+
+
+def fm_get():
+    return {"on": _rx_input() == "TUNER", "bri": 254}
+
+
+def fm_set(on=None, bri=None):
+    if on:
+        _x("x/tuner", action="select")
+    elif on is False:
+        api("receiver/input", input="PC")
+
+
+def usb_get():
+    return {"on": _rx_input() == "USB", "bri": 254}
+
+
+def usb_set(on=None, bri=None):
+    if on:
+        _x("x/usb", action="select_input")
+        _x("x/usb", action="Play")
+    elif on is False:
+        api("receiver/input", input="PC")
+
+
+def dialogue_get():
+    return {"on": (_x("x/sound").get("dialogue_lift") or 0) > 0, "bri": 254}
+
+
+def dialogue_set(on=None, bri=None):
+    if on is not None:
+        _x("x/sound", key="dialogue_lift", value="3" if on else "0")
+
+
+def sleep_get():
+    s = _x("x/sleep").get("sleep_s", 0)
+    return {"on": s > 0, "bri": max(1, min(254, round(s / 60 / 90 * 254))) if s else 1}
+
+
+def sleep_set(on=None, bri=None):
+    # "Alexa, turn on Sleep Timer" = 30 min; "set Sleep Timer to 50%" = 45 min
+    if bri is not None:
+        _x("x/sleep", minutes=f"{max(1, round(bri / 254 * 90))}")
+    elif on:
+        _x("x/sleep", minutes="30")
+    elif on is False:
+        _x("x/sleep", cancel="1")
+
+
+def preset_dev(n):
+    def g():
+        t = _x("x/tuner")
+        return {"on": _rx_input() == "TUNER" and str(t.get("preset")) == str(n), "bri": 254}
+
+    def s(on=None, bri=None):
+        if on:
+            _x("x/tuner", action="preset", value=str(n))
+    return {"name": f"Radio Preset {n}", "get": g, "set": s, "dim": False}
+
+
 def scene_dev(name):
     def g():
         return {"on": False, "bri": 254}         # scenes are triggers, never "on"
@@ -165,6 +234,10 @@ STATIC = {
     "3": {"name": "Music", "get": music_get, "set": music_set, "dim": False},
     "4": {"name": "Night Mode", "get": night_get, "set": night_set, "dim": False},
     "5": {"name": "Zone 2", "get": zone2_get, "set": zone2_set, "dim": True},
+    "6": {"name": "FM Radio", "get": fm_get, "set": fm_set, "dim": False},
+    "7": {"name": "USB", "get": usb_get, "set": usb_set, "dim": False},
+    "8": {"name": "Dialogue Lift", "get": dialogue_get, "set": dialogue_set, "dim": False},
+    "9": {"name": "Sleep Timer", "get": sleep_get, "set": sleep_set, "dim": True},
 }
 _dev_cache = {"t": 0.0, "d": dict(STATIC)}
 
@@ -177,6 +250,11 @@ def devices():
         try:
             for i, sc in enumerate(api("x/scenes").get("scenes", [])[:30]):
                 d[str(20 + i)] = scene_dev(sc["name"])
+        except Exception:
+            pass
+        try:                                     # one device per FM/AM preset, ids 60+
+            for p in _x("x/tuner").get("presets", [])[:20]:
+                d[str(60 + int(p["n"]))] = preset_dev(p["n"])
         except Exception:
             pass
         _dev_cache.update(t=time.time(), d=d)

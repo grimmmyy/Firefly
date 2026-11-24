@@ -770,6 +770,25 @@ def _rx_send(port, path, data, headers, timeout, method="POST"):
             raise
 
 
+# Receiver response time, bucketed per hour (last 48 h): a slowly rising
+# median is the early warning before its network control freezes.
+rx_latency = {}          # hour start (epoch) -> [count, sum_ms, max_ms, slow(>1 s)]
+
+
+def rx_latency_add(sec):
+    h = int(time.time() // 3600 * 3600)
+    b = rx_latency.setdefault(h, [0, 0.0, 0.0, 0])
+    ms = sec * 1000
+    b[0] += 1; b[1] += ms; b[2] = max(b[2], ms); b[3] += ms > 1000
+    for k in [k for k in rx_latency if k < h - 48 * 3600]:
+        del rx_latency[k]
+
+
+def rx_latency_report():
+    return [{"hour": h, "n": b[0], "avg_ms": round(b[1] / b[0]), "max_ms": round(b[2]),
+             "slow": b[3]} for h, b in sorted(rx_latency.items()) if b[0]]
+
+
 def rx_request(req, timeout=5, with_headers=False):
     with RX_GATE:
         if time.time() < rx_stats["retry_at"]:
@@ -782,8 +801,10 @@ def rx_request(req, timeout=5, with_headers=False):
                  (req.data or b"")[:60].decode("utf-8", "replace"))).replace(chr(10), " ")
         try:
             u = urllib.parse.urlsplit(req.full_url)
+            t0 = time.monotonic()
             body, hdrs = _rx_send(u.port or 80, u.path, req.data, dict(req.header_items()),
                                   timeout, req.get_method())
+            rx_latency_add(time.monotonic() - t0)
             rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
             if rx_stats["first_fail"]:
                 log.info("receiver control recovered after %ds down",
