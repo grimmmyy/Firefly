@@ -44,6 +44,8 @@
     <true/>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Scan the pairing code shown on the speaker bridge page.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Firefly needs local network access to discover your Yamaha receiver and stream audio to it over Wi-Fi.</string>
     <key>NSBonjourServices</key>

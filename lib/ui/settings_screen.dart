@@ -5,6 +5,7 @@ import '../theme.dart';
 import 'shell.dart';
 import 'widgets.dart';
 import 'account_tile.dart';
+import 'setup_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   final AppState app;
@@ -39,6 +40,16 @@ class SettingsScreen extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       children: [
         const Text('Settings', style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 8),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.health_and_safety_outlined, color: FireflyTheme.amber),
+            title: const Text('Set up & check'),
+            subtitle: const Text('Find devices, run the health check, play a test tone, pair'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => openSetup(context, app),
+          ),
+        ),
 
         // ---------------------------------------------------------- people
         SectionLabel('Spotify accounts · ${s.accounts} linked',
@@ -135,8 +146,14 @@ class SettingsScreen extends StatelessWidget {
             ListTile(
               leading: Icon(Icons.router,
                   color: s.online ? FireflyTheme.spotify : Colors.redAccent),
-              title: Text(s.online ? 'Connected' : (s.error ?? 'Not connected')),
-              subtitle: Text(s.host ?? 'not found'),
+              title: Text(s.online && !s.reconnecting
+                  ? (s.remote ? 'Connected via Tailscale' : 'Connected')
+                  : (s.error ?? 'Not connected')),
+              subtitle: Text([
+                s.host ?? 'not found',
+                if (s.receiverIp != null) 'receiver ${s.receiverIp}',
+                if (s.remoteHost != null) 'remote ${s.remoteHost}',
+              ].join(' · ')),
               trailing: TextButton(
                 child: const Text('Change'),
                 onPressed: () async {

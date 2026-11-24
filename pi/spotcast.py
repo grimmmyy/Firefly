@@ -75,6 +75,13 @@ class Hub:
             return len(self.clients)
 
 
+# Pre-roll: a new receiver connection first gets the last PREROLL_MS of audio,
+# so its buffer starts full instead of stuttering through the first second.
+# buffer_tuner trims the extra latency back off during the next silence.
+PREROLL_MS = int(os.environ.get("SPOTCAST_PREROLL_MS", "400"))
+_preroll = []          # recent wav chunks (bytes), newest last
+
+
 # Receiver buffer tuning. The RX-V671 settles at a random 0.25-0.8 s buffer per
 # connection, with a ~0.3 s floor it refills to. Withholding silent audio for d
 # seconds shrinks its buffer by d, so we trim each connection down to TARGET.
@@ -179,6 +186,10 @@ def start_pipeline():
                     tune["drained"] += step
                 else:
                     wav_hub.publish(out)
+            if PREROLL_MS > 0:
+                _preroll.append(out)
+                if len(_preroll) > PREROLL_MS // CHUNK_MS:
+                    del _preroll[0]
             if hub.count():
                 try:
                     ff.stdin.write(out)
@@ -1580,7 +1591,8 @@ def api_status():
     vol, mute = receiver_volume()
     sl = sleep_timer["until"]
     return {
-        "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"],
+        "receiver": {"ip": RECEIVER, "power": pw, "input": inp,
+                     "reachable": health["receiver_ok"],
                      "volume_db": vol, "mute": mute, "max_db": MAX_DB},
         "queue": queue(),
         "follow": follow.status(),
@@ -1602,9 +1614,313 @@ def api_status():
         "health": {k: health[k] for k in ("stalls", "reconnects", "last_stall",
                                           "soloist_days_left", "started")},
         "stream_url": STREAM_URL,
+        "tailscale_ip": tailscale_ip(),
+        "alerts": {"ntfy": bool(NTFY_TOPIC), "discord": bool(DISCORD_WEBHOOK),
+                   "heartbeat": bool(HEARTBEAT_URL)},
         "upnp_events": {"subscribed": upnp_subscribed(), "state": upnp["state"],
                         "age_s": int(time.time() - upnp["t"]) if upnp["t"] else None},
     }
+
+
+# ---------------- setup & connectivity helpers ----------------
+import ipaddress, secrets, math
+
+RECEIVER_FILE = "/var/lib/spotcast-user/receiver_ip"
+PAIR_FILE = "/var/lib/spotcast-user/pair_token"
+HEARTBEAT_URL = os.environ.get("SPOTCAST_HEARTBEAT_URL", "")   # e.g. healthchecks.io ping URL
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")                    # Tailscale addresses
+
+
+def _ssdp_locations(timeout=4.0):
+    """M-SEARCH for MediaRenderers; returns {description URL}."""
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+           'MAN: "ssdp:discover"\r\nMX: 2\r\n'
+           "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n").encode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    found = set()
+    try:
+        for _ in range(2):
+            s.sendto(msg, ("239.255.255.250", 1900))
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                data, _ = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            m = re.search(rb"(?im)^location:\s*(\S+)", data)
+            if m:
+                found.add(m.group(1).decode("ascii", "replace"))
+    finally:
+        s.close()
+    return found
+
+
+def discover_receiver():
+    """Find a Yamaha RX-* receiver on the LAN. Returns its IP or None."""
+    try:
+        locs = _ssdp_locations()
+    except OSError as e:
+        log.info("receiver discovery failed: %s", e)
+        return None
+    for loc in sorted(locs):
+        try:
+            with urllib.request.urlopen(loc, timeout=3) as r:
+                desc = r.read(65536).decode("utf-8", "replace")
+        except Exception:
+            continue
+        model = re.search(r"<modelName>([^<]*)", desc)
+        maker = re.search(r"<manufacturer>([^<]*)", desc)
+        if (model and model.group(1).upper().startswith("RX-")) or \
+                (maker and "yamaha" in maker.group(1).lower()):
+            return urllib.parse.urlsplit(loc).hostname
+    return None
+
+
+def set_receiver(ip, why=""):
+    global RECEIVER
+    if not ip or ip == RECEIVER:
+        return
+    log.info("receiver address %s -> %s (%s)", RECEIVER, ip, why)
+    event("receiver-moved", old=RECEIVER, new=ip, why=why)
+    with RX_GATE:
+        for c in _rx_conns.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        _rx_conns.clear()
+        RECEIVER = ip
+        rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
+    upnp.update(sid=None, until=0.0, state=None, uri=None)
+    invalidate_basic()
+    try:
+        with open(RECEIVER_FILE, "w") as f:
+            f.write(ip)
+    except OSError:
+        pass
+
+
+def _ync_alive(ip, timeout=3):
+    try:
+        req = urllib.request.Request(
+            f"http://{ip}/YamahaRemoteControl/ctrl", method="POST",
+            data=b'<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
+                 b'</Basic_Status></Main_Zone></YAMAHA_AV>',
+            headers={"Content-Type": "text/xml"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return b"<Power>" in r.read()
+    except Exception:
+        return False
+
+
+def locate_receiver_at_start():
+    """Configured address first, then the last one we found, then SSDP."""
+    if _ync_alive(RECEIVER):
+        return
+    try:
+        saved = open(RECEIVER_FILE).read().strip()
+    except OSError:
+        saved = ""
+    if saved and saved != RECEIVER and _ync_alive(saved):
+        set_receiver(saved, "last known address")
+        return
+    ip = discover_receiver()
+    if ip:
+        set_receiver(ip, "found by SSDP at start")
+
+
+def receiver_finder():
+    """If the receiver stops answering for a minute, look for it at a new address
+    (DHCP lease change, router swap)."""
+    while True:
+        time.sleep(30)
+        ff = rx_stats["first_fail"]
+        if not ff or time.time() - ff < 60:
+            continue
+        ip = discover_receiver()
+        if ip and ip != RECEIVER:
+            set_receiver(ip, "unreachable at old address")
+            alert("receiver-moved", f"Receiver moved to {ip}; switched over automatically",
+                  every=0)
+            time.sleep(60)
+        else:
+            time.sleep(90)
+
+
+def netwatch():
+    """Ethernet <-> Wi-Fi failover: when our LAN address changes mid-stream the
+    receiver's connection is dead, so point it at the new stream URL at once."""
+    while True:
+        time.sleep(5)
+        old = STREAM_URL
+        refresh_stream_url()
+        if STREAM_URL != old and old is not None:
+            event("net-failover", old=old, new=STREAM_URL)
+            alert("net-failover", f"Pi network changed; stream now at {STREAM_URL}", every=600)
+            upnp.update(sid=None, until=0.0)    # resubscribe with the new callback address
+            if any(x.playing for x in slots.slots) or wav_hub.count():
+                threading.Thread(target=ensure_playing, daemon=True).start()
+
+
+def heartbeat():
+    """Dead-man ping: a service like healthchecks.io alerts when these stop,
+    which is the only way to hear about the Pi itself being offline."""
+    while HEARTBEAT_URL:
+        try:
+            urllib.request.urlopen(HEARTBEAT_URL, timeout=10).read()
+        except Exception as e:
+            log.info("heartbeat failed: %s", e)
+        time.sleep(60)
+
+
+def iface_addrs():
+    """{iface: ipv4} for every non-loopback interface."""
+    out = {}
+    for line in sh_out("ip -4 -o addr show").splitlines():
+        m = re.match(r"\d+:\s+(\S+)\s+inet\s+([\d.]+)", line)
+        if m and m.group(1) != "lo":
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def tailscale_ip():
+    for name, ip in iface_addrs().items():
+        if name.startswith("tailscale") or ipaddress.ip_address(ip) in _CGNAT:
+            return ip
+    return None
+
+
+def pair_token():
+    try:
+        t = open(PAIR_FILE).read().strip()
+        if t:
+            return t
+    except OSError:
+        pass
+    t = secrets.token_urlsafe(18)
+    old = os.umask(0o077)
+    try:
+        with open(PAIR_FILE, "w") as f:
+            f.write(t)
+    except OSError:
+        pass
+    finally:
+        os.umask(old)
+    return t
+
+
+def pair_uri():
+    q = {"h": lan_ip(), "t": pair_token()}
+    ts = tailscale_ip()
+    if ts:
+        q["ts"] = ts
+    return "firefly://pair?" + urllib.parse.urlencode(q)
+
+
+def qr_svg(text):
+    """QR code as inline SVG via the qrencode CLI (installed by install.sh)."""
+    try:
+        r = subprocess.run(["qrencode", "-t", "SVG", "-m", "2", "-s", "6", "-o", "-", text],
+                           capture_output=True, timeout=5)
+        svg = r.stdout.decode("utf-8", "replace")
+        i = svg.find("<svg")
+        return svg[i:] if i >= 0 else ""
+    except Exception:
+        return ""
+
+
+def is_remote(ip):
+    """True for clients outside the home LAN (Tailscale, anything public)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return not (a.is_loopback or (a.is_private and a not in _CGNAT))
+
+
+def recent_problems(n=8):
+    kinds = {"alert", "stall", "rx-down", "net-failover", "receiver-moved", "hand-override"}
+    out = []
+    try:
+        with open(EVENT_LOG) as f:
+            lines = f.readlines()[-400:]
+    except OSError:
+        return out
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("kind") in kinds:
+            out.append(e)
+            if len(out) >= n:
+                break
+    return out
+
+
+def diagnose():
+    """Every known way this setup fails, checked live. Each: id, ok, detail, fix."""
+    res = []
+
+    def add(i, ok, detail, fix=""):
+        res.append({"id": i, "ok": bool(ok), "detail": detail, "fix": "" if ok else fix})
+    alive = _ync_alive(RECEIVER)
+    add("receiver", alive, f"Receiver at {RECEIVER}" + (" answers" if alive else " not answering"),
+        "Check the receiver has power and its network cable; Network Standby must be On")
+    if alive:
+        invalidate_basic()
+        pw, inp = receiver_status()
+        add("power", pw == "On", f"Power: {pw}",
+            "It's in standby; playing switches it on automatically")
+        add("input", inp == "PC", f"Input: {inp}",
+            "Not on PC; playing switches it, or pick 'Spotify / Firefly' as the input")
+        try:
+            urllib.request.urlopen(f"http://{RECEIVER}:{RECEIVER_UPNP}/MediaRenderer/desc.xml",
+                                   timeout=3).read(64)
+            add("upnp", True, "DLNA renderer reachable")
+        except Exception as e:
+            add("upnp", False, f"DLNA renderer not reachable ({e})",
+                "Power-cycle the receiver; check Network Standby is On")
+    add("events", upnp_subscribed(), "Receiver pushes state changes" if upnp_subscribed()
+        else "Not subscribed to receiver events (polling instead)",
+        "Usually recovers by itself within a minute")
+    try:
+        with socket.create_connection((lan_ip(), PORT), timeout=2):
+            pass
+        add("stream", True, f"Stream served at {STREAM_URL}")
+    except OSError as e:
+        add("stream", False, f"Stream port not reachable ({e})", "Restart spotcast.service")
+    ifs = iface_addrs()
+    eth = next((v for k, v in ifs.items() if k.startswith(("eth", "en"))), None)
+    add("ethernet", eth is not None, f"Ethernet {eth}" if eth else "Ethernet not connected",
+        "Running on Wi-Fi; plug in the cable for steadier audio")
+    d = health["soloist_days_left"]
+    add("soloist", d is None or d > 10,
+        f"Spotify player build: {d} days left" if d is not None else "Spotify player build OK",
+        "Tap 'Check now' under auto-update")
+    paired = sum(1 for x in slots.slots if x.paired)
+    add("accounts", paired > 0, f"{paired} Spotify account(s) linked",
+        "In Spotify on home Wi-Fi, pick 'Living Room - Add me'")
+    ts = tailscale_ip()
+    add("remote", ts is not None, f"Remote access via Tailscale {ts}" if ts
+        else "No Tailscale (app works at home only)", "Optional: install Tailscale on the Pi")
+    return res
+
+
+def _tone_wav(seconds=2.0, hz=660.0):
+    n = int(44100 * seconds)
+    frames = bytearray()
+    for i in range(n):
+        env = min(1.0, i / 2000, (n - i) / 2000)        # click-free fade
+        v = int(9000 * env * math.sin(2 * math.pi * hz * i / 44100))
+        frames += struct.pack("<hh", v, v)
+    return (b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) +
+            b"data" + struct.pack("<I", len(frames)) + bytes(frames))
+
+
+TONE = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1628,6 +1944,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if p.path == "/api/status":
                 out = api_status()
+            elif p.path == "/api/diagnose":
+                out = {"checks": diagnose()}
+            elif p.path == "/api/pair":
+                out = {"uri": pair_uri()}
+            elif p.path == "/api/rediscover":
+                ip = discover_receiver()
+                if ip:
+                    set_receiver(ip, "requested from app")
+                out = {"ok": bool(ip), "receiver": RECEIVER}
             elif p.path == "/api/add":
                 slots.open_add_window(); out = {"ok": True}
             elif p.path == "/api/ignore":
@@ -1728,8 +2053,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("contentFeatures.dlna.org", f"{pn};{feats}" if pn else feats)
         self.end_headers()
 
+    def _remote_denied(self, p):
+        """Off the home LAN (e.g. over Tailscale) everything but the audio
+        needs the pairing token."""
+        if not is_remote(self.client_address[0]):
+            return False
+        qs = urllib.parse.parse_qs(p.query)
+        tok = self.headers.get("X-Firefly-Token") or (qs.get("t") or [""])[0]
+        if tok and secrets.compare_digest(tok, pair_token()):
+            return False
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"error":"pairing token required"}')
+        return True
+
     def do_GET(self):
+        global TONE
         p = urllib.parse.urlparse(self.path)
+        if p.path not in self.FORMATS and p.path != "/tone.wav" and self._remote_denied(p):
+            return
+        if p.path == "/tone.wav":
+            if TONE is None:
+                TONE = _tone_wav()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(TONE)))
+            self.end_headers()
+            self.wfile.write(TONE)
+            return
         if p.path in self.FORMATS:
             self._stream_headers(p.path)
             if p.path == "/stream.wav":
@@ -1746,6 +2098,8 @@ class Handler(BaseHTTPRequestHandler):
                 event("connect", ip=self.client_address[0])
             c = src.add()
             q, ev = c
+            if src is wav_hub and PREROLL_MS > 0:
+                q[:0] = list(_preroll)
             log.info("client connected %s (%d total)", self.client_address[0], hub.count())
             try:
                 while True:
@@ -1807,7 +2161,8 @@ code{{color:#ddd}}</style>
 <p>These make 'Add me' appear. Ignore TVs and speakers that aren't people.</p>
 <ul>{rows(devices.unknown, 'ignore', 'ignore')}</ul>
 <h3>Registered devices</h3><ul>{rows(devices.reg, 'forget', 'forget')}</ul>
-<h3>Ignored</h3><ul>{rows(devices.ignored, 'forget', 'un-ignore')}</ul>""".encode()
+<h3>Ignored</h3><ul>{rows(devices.ignored, 'forget', 'un-ignore')}</ul>
+{health_html()}""".encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -1825,8 +2180,35 @@ code{{color:#ddd}}</style>
             self.send_response(404); self.end_headers()
 
 
+def health_html():
+    """Health + pairing section of the status page."""
+    checks = diagnose()
+    li = "".join(
+        f"<li class={'on' if c['ok'] else 'bad'}>{'&#10003;' if c['ok'] else '&#10007;'} "
+        f"{html.escape(c['detail'])}"
+        + (f"<br><small>{html.escape(c['fix'])}</small>" if c["fix"] else "") + "</li>"
+        for c in checks)
+    probs = "".join(
+        f"<li>{time.strftime('%b %d %H:%M', time.localtime(e['t']))} &middot; "
+        f"{html.escape(e.get('text') or e['kind'])}</li>" for e in recent_problems()) \
+        or "<li>none</li>"
+    acct = next((x.name() for x in slots.slots if x.playing), None)
+    uri = pair_uri()
+    qr = qr_svg(uri)
+    return f"""<style>.bad{{color:#ff6b6b}}small{{color:#888}}
+.qr{{background:#fff;padding:8px;border-radius:12px;width:220px}}.qr svg{{width:100%;height:auto}}</style>
+<h3>Health</h3><p>Receiver {html.escape(RECEIVER)} &middot; stream {html.escape(STREAM_URL or '')}
+&middot; playing: {html.escape(acct or 'nobody')}</p><ul>{li}</ul>
+<h3>Recent problems</h3><ul>{probs}</ul>
+<h3>Pair the Firefly app</h3>
+<p>In Firefly: Settings &rarr; Set up &rarr; Scan pairing code.</p>
+{f'<div class=qr>{qr}</div>' if qr else ''}
+<p><small>Or paste: <code>{html.escape(uri)}</code></small></p>"""
+
+
 def main():
     global STREAM_URL
+    locate_receiver_at_start()
     while True:
         try:
             STREAM_URL = f"http://{lan_ip()}:{PORT}/stream.{FORMAT}"
@@ -1845,6 +2227,9 @@ def main():
     threading.Thread(target=pin_stream_volumes, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
     threading.Thread(target=sound_watch, daemon=True).start()
+    threading.Thread(target=receiver_finder, daemon=True).start()
+    threading.Thread(target=netwatch, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:

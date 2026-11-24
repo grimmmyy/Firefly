@@ -8,6 +8,7 @@ import 'library_screen.dart';
 import 'now_playing_sheet.dart';
 import 'radio_screen.dart';
 import 'settings_screen.dart';
+import 'setup_screen.dart';
 
 /// Bundles the two controllers so every screen gets both.
 class AppState {
@@ -37,7 +38,10 @@ class _ShellState extends State<Shell> {
     a.cast.loadRecents();
     a.cast.discover();
     a.spot.start();
+    WidgetsBinding.instance.addPostFrameCallback((_) => maybeFirstRunSetup(context, a));
   }
+
+  bool _seeded = false;
 
   @override
   void dispose() {
@@ -47,6 +51,13 @@ class _ShellState extends State<Shell> {
   }
 
   void _changed() {
+    // The bridge knows where the receiver is; use that if our own scan missed it.
+    final a = widget.app;
+    final rx = a.spot.receiverIp;
+    if (!_seeded && rx != null && !a.cast.discovering && a.cast.selected == null) {
+      _seeded = true;
+      a.cast.addReceiverByIp(rx);
+    }
     if (mounted) setState(() {});
   }
 

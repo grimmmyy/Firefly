@@ -2,14 +2,23 @@
 # spotcast installer: turns a Raspberry Pi (64-bit Debian/Raspberry Pi OS,
 # Bookworm or Trixie) into a Spotify Connect bridge for a DLNA receiver.
 #
-#   sudo SOLOIST_API_KEY=spak_... RECEIVER_IP=192.168.1.7 ./install.sh
+#   sudo ./install.sh                      (asks for anything it needs)
+#   sudo SOLOIST_API_KEY=spak_... ./install.sh
 #
-# Optional env: SPEAKER_NAME ("Living Room (RX-V671)"), NTFY_TOPIC, DISCORD_WEBHOOK
+# Optional env: RECEIVER_IP (found automatically if unset), SPEAKER_NAME,
+# NTFY_TOPIC, DISCORD_WEBHOOK, HEARTBEAT_URL (healthchecks.io-style ping URL)
 set -eu
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
+if [ -z "${SOLOIST_API_KEY:-}" ] && [ -r /etc/spotcast/soloist.env ]; then
+  SOLOIST_API_KEY=$(sed -n 's/^SOLOIST_API_KEY=//p' /etc/spotcast/soloist.env)  # re-install keeps it
+fi
+if [ -z "${SOLOIST_API_KEY:-}" ] && [ -r /dev/tty ]; then
+  printf "Spotify Soloist API key (https://developer.spotify.com/dashboard/soloist): " >/dev/tty
+  stty -echo </dev/tty; read -r SOLOIST_API_KEY </dev/tty; stty echo </dev/tty; echo >/dev/tty
+fi
 : "${SOLOIST_API_KEY:?set SOLOIST_API_KEY (https://developer.spotify.com/dashboard/soloist)}"
-: "${RECEIVER_IP:?set RECEIVER_IP to your receiver's LAN address}"
+RECEIVER_IP="${RECEIVER_IP:-}"
 SPEAKER_NAME="${SPEAKER_NAME:-Living Room (RX-V671)}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -24,7 +33,7 @@ esac
 echo "==> packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  python3 ffmpeg curl pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 nftables >/dev/null
+  python3 ffmpeg curl qrencode pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 nftables >/dev/null
 
 echo "==> service user"
 id spotcast >/dev/null 2>&1 || useradd -r -m -d /var/lib/spotcast-user -s /usr/sbin/nologin spotcast
@@ -55,10 +64,12 @@ visudo -cf /etc/sudoers.d/spotcast >/dev/null
 umask 077
 {
   echo "SOLOIST_API_KEY=$SOLOIST_API_KEY"
-  echo "SPOTCAST_RECEIVER=$RECEIVER_IP"
+  [ -n "$RECEIVER_IP" ] && echo "SPOTCAST_RECEIVER=$RECEIVER_IP"
   echo "SPOTCAST_NAME=$SPEAKER_NAME"
   [ -n "${NTFY_TOPIC:-}" ] && echo "SPOTCAST_NTFY_TOPIC=$NTFY_TOPIC"
   [ -n "${DISCORD_WEBHOOK:-}" ] && echo "SPOTCAST_DISCORD_WEBHOOK=$DISCORD_WEBHOOK"
+  [ -n "${HEARTBEAT_URL:-}" ] && echo "SPOTCAST_HEARTBEAT_URL=$HEARTBEAT_URL"
+  true
 } > /etc/spotcast/soloist.env
 umask 022
 chown spotcast /etc/spotcast/soloist.env
@@ -74,4 +85,5 @@ systemctl enable --now spotcast soloist-update.timer
 
 echo
 echo "Done. In Spotify (on the same Wi-Fi), pick \"Living Room - Add me\" to link your account."
-echo "Status page: http://$(hostname -I | awk '{print $1}'):8090"
+echo "Status page + app pairing code: http://$(hostname -I | awk '{print $1}'):8090"
+[ -n "$RECEIVER_IP" ] || echo "(The receiver is found automatically; see the status page to confirm.)"

@@ -95,16 +95,22 @@ flowchart LR
 
 ### 2. Raspberry Pi bridge
 1. Create a Soloist API key at <https://developer.spotify.com/dashboard/soloist> (Premium account).
-2. On the Pi:
+2. On the Pi, one command (it asks for the key; the receiver is found automatically):
    ```sh
-   git clone https://github.com/grimmmyy/Firefly.git
-   cd Firefly/pi
-   sudo SOLOIST_API_KEY=spak_xxx RECEIVER_IP=192.168.1.7 ./install.sh
+   curl -fsSL https://raw.githubusercontent.com/grimmmyy/Firefly/main/pi/get.sh | sudo sh
    ```
-   Optional: `SPEAKER_NAME="Kitchen (RX-V671)"`, `NTFY_TOPIC=my-private-topic`, `DISCORD_WEBHOOK=https://…`
+   Or from a clone: `cd Firefly/pi && sudo ./install.sh`.
+   Optional env: `RECEIVER_IP=…` (skip discovery), `SPEAKER_NAME="Kitchen (RX-V671)"`,
+   `NTFY_TOPIC=my-private-topic`, `DISCORD_WEBHOOK=https://…`,
+   `HEARTBEAT_URL=https://hc-ping.com/…` (alerts you when the Pi itself goes offline).
 3. In Spotify on the same Wi-Fi, pick **Living Room - Add me** once. From then on it appears as
    **Living Room (RX-V671)** on your account.
-4. Status page: `http://<pi-ip>:8090` · JSON: `http://<pi-ip>:8090/api/status`
+4. Status page: `http://<pi-ip>:8090`: health checks, recent problems and the app pairing QR code.
+   JSON: `/api/status`, `/api/diagnose`.
+
+The bridge finds the receiver again by itself if its address changes, and re-points the stream
+when the Pi switches between Ethernet and Wi-Fi. With Tailscale on the Pi and your phone, a paired
+app works away from home (off the LAN the API requires the pairing token).
 
 The API key is stored only in `/etc/spotcast/soloist.env` (mode 600) on the Pi.
 
@@ -119,6 +125,9 @@ Download from the [latest release](../../releases/latest):
 
 Every release ships all three, and CI refuses to publish a release unless the EXE, IPA and APK all built.
 Each release also includes the Raspberry Pi bridge (`spotcast-pi-bridge-vX.tar.gz`) and `SHA256SUMS.txt`.
+
+On first launch Firefly runs **Set up & check** (also in Settings): it finds the bridge and receiver,
+runs the bridge's health check, plays a test tone, and can scan the bridge's pairing code.
 
 On first launch, allow **Local Network** access (iOS) and the Windows Firewall prompt (**Private** networks),
 because the receiver pulls audio from the app.
