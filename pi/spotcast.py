@@ -721,7 +721,26 @@ class ReceiverBackoff(OSError):
 _rx_conns = {}
 
 
+# The RX-V671's 2011 web server wedged (needing a wall unplug) after the switch
+# to kept-open connections + GENA on 2026-11-18. Default back to one request
+# per connection; SPOTCAST_RX_KEEPALIVE=1 restores kept-open.
+RX_KEEPALIVE = os.environ.get("SPOTCAST_RX_KEEPALIVE", "0") == "1"
+
+
 def _rx_send(port, path, data, headers, timeout, method="POST"):
+    if not RX_KEEPALIVE:
+        headers = {**headers, "Connection": "close"}
+        conn = http.client.HTTPConnection(RECEIVER, port, timeout=timeout)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            r = conn.getresponse()
+            body = r.read().decode("utf-8", "replace")
+            if r.status >= 400:
+                raise urllib.error.HTTPError(f"http://{RECEIVER}:{port}{path}", r.status,
+                                             r.reason, r.headers, None)
+            return body, r.headers
+        finally:
+            conn.close()
     for attempt in (1, 2):
         conn = _rx_conns.get(port)
         fresh = conn is None
@@ -905,7 +924,11 @@ def health_monitor():
                 health["receiver_fail_since"] = time.time()
             elif time.time() - health["receiver_fail_since"] > 300 and health["receiver_ok"]:
                 health["receiver_ok"] = False
-                alert("receiver-down", "Receiver (RX-V671) unreachable for 5 minutes - "
+                frozen = sh_out(["ping", "-c1", "-W1", RECEIVER]).find(" 0% packet loss") >= 0
+                alert("receiver-down",
+                      "Receiver (RX-V671) answers ping but its network control is frozen - "
+                      "unplug it from the wall for 30 s" if frozen else
+                      "Receiver (RX-V671) unreachable for 5 minutes - "
                       "check its power and network cable")
         else:
             if not health["receiver_ok"]:
@@ -1395,6 +1418,11 @@ def watchdog():
 # answers from this cache instead of two SOAP polls every few seconds. If the
 # subscription lapses, it falls back to polling.
 UPNP_SUB_S = int(os.environ.get("SPOTCAST_UPNP_SUB_S", "1800"))
+# Off by default: every daily soloist-update restart re-subscribed without
+# cancelling the old subscription, and the receiver froze within seconds
+# (Nov 19-23, every morning ~04:05). Polling worked for months before.
+UPNP_EVENTS = os.environ.get("SPOTCAST_UPNP_EVENTS", "0") == "1"
+UPNP_SID_FILE = "/var/lib/spotcast-user/upnp_sid"
 upnp = {"sid": None, "until": 0.0, "callback": None, "state": None, "uri": None,
         "t": 0.0, "changed": threading.Event()}
 
@@ -1432,10 +1460,44 @@ def _upnp_subscribe():
         log.info("upnp: subscribed to AVTransport events (%ds)", secs)
         upnp["state"] = upnp["uri"] = None   # initial NOTIFY carries full state
     upnp.update(sid=sid, callback=cb, until=time.time() + secs)
+    try:
+        with open(UPNP_SID_FILE, "w") as f:
+            f.write(sid or "")
+    except OSError:
+        pass
     return secs
 
 
+def upnp_unsubscribe(sid=None, timeout=3):
+    """Cancel a subscription directly (bypasses back-off; used at exit/start)."""
+    sid = sid or upnp["sid"]
+    if not sid:
+        return
+    try:
+        c = http.client.HTTPConnection(RECEIVER, int(RECEIVER_UPNP), timeout=timeout)
+        c.request("UNSUBSCRIBE", "/AVTransport/event", headers={"SID": sid, "Connection": "close"})
+        c.getresponse().read()
+        c.close()
+        log.info("upnp: unsubscribed %s", sid[:12])
+    except Exception as e:
+        log.info("upnp: unsubscribe failed: %s", e)
+    upnp.update(sid=None, until=0.0)
+    try:
+        os.remove(UPNP_SID_FILE)
+    except OSError:
+        pass
+
+
 def upnp_events():
+    try:                                   # a previous process's subscription
+        stale = open(UPNP_SID_FILE).read().strip()
+    except OSError:
+        stale = ""
+    if stale:
+        upnp_unsubscribe(stale)
+    if not UPNP_EVENTS:
+        log.info("upnp: events off, polling the receiver")
+        return
     while True:
         try:
             secs = _upnp_subscribe()
@@ -1758,7 +1820,8 @@ def netwatch():
         if STREAM_URL != old and old is not None:
             event("net-failover", old=old, new=STREAM_URL)
             alert("net-failover", f"Pi network changed; stream now at {STREAM_URL}", every=600)
-            upnp.update(sid=None, until=0.0)    # resubscribe with the new callback address
+            if upnp["sid"]:
+                upnp_unsubscribe()              # resubscribe with the new callback address
             if any(x.playing for x in slots.slots) or wav_hub.count():
                 threading.Thread(target=ensure_playing, daemon=True).start()
 
@@ -1882,9 +1945,10 @@ def diagnose():
         except Exception as e:
             add("upnp", False, f"DLNA renderer not reachable ({e})",
                 "Power-cycle the receiver; check Network Standby is On")
-    add("events", upnp_subscribed(), "Receiver pushes state changes" if upnp_subscribed()
-        else "Not subscribed to receiver events (polling instead)",
-        "Usually recovers by itself within a minute")
+    if UPNP_EVENTS:
+        add("events", upnp_subscribed(), "Receiver pushes state changes" if upnp_subscribed()
+            else "Not subscribed to receiver events (polling instead)",
+            "Usually recovers by itself within a minute")
     try:
         with socket.create_connection((lan_ip(), PORT), timeout=2):
             pass
@@ -2206,8 +2270,15 @@ def health_html():
 <p><small>Or paste: <code>{html.escape(uri)}</code></small></p>"""
 
 
+def _on_term(signum, frame):
+    upnp_unsubscribe()
+    os._exit(0)
+
+
 def main():
     global STREAM_URL
+    import signal
+    signal.signal(signal.SIGTERM, _on_term)
     locate_receiver_at_start()
     while True:
         try:
