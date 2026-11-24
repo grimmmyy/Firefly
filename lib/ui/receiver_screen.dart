@@ -254,7 +254,7 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
         ListTile(
           leading: const Icon(Icons.label_outline),
           title: const Text('Input names'),
-          subtitle: const Text('e.g. HDMI1 → Fire TV, shown on the receiver's display'),
+          subtitle: const Text('e.g. HDMI1 → Fire TV, shown on the receiver\'s display'),
           trailing: const Icon(Icons.chevron_right),
           onTap: () async {
             await Navigator.push(
