@@ -1777,7 +1777,7 @@ def heartbeat():
 def iface_addrs():
     """{iface: ipv4} for every non-loopback interface."""
     out = {}
-    for line in sh_out("ip -4 -o addr show").splitlines():
+    for line in sh_out(["ip", "-4", "-o", "addr", "show"]).splitlines():
         m = re.match(r"\d+:\s+(\S+)\s+inet\s+([\d.]+)", line)
         if m and m.group(1) != "lo":
             out[m.group(1)] = m.group(2)
