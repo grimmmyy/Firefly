@@ -999,6 +999,11 @@ def tuner_set(action, value=None, band=None):
     return tuner_state()
 
 
+def _meta(xml, name):
+    v = html.unescape(_tag(xml, name) or "").strip()
+    return "" if v.strip("-") == "" else v          # the receiver shows "---" for none
+
+
 def browse_state(src):
     _, tag = RX_SOURCES[src]
     cfgx = get(tag, "<Config>GetParam</Config>") or ""
@@ -1016,9 +1021,8 @@ def browse_state(src):
             "busy": _tag(li, "Menu_Status") == "Busy",
             "lines": lines, "first": cur - (cur - 1) % 8, "total": mx,
             "playing": _tag(pi, "Playback_Info") == "Play",
-            "artist": html.unescape(_tag(pi, "Artist") or ""),
-            "album": html.unescape(_tag(pi, "Album") or ""),
-            "song": html.unescape(_tag(pi, "Song") or ""),
+            "artist": _meta(pi, "Artist"), "album": _meta(pi, "Album"),
+            "song": _meta(pi, "Song"),
             "repeat": _tag(pi, "Repeat"), "shuffle": _tag(pi, "Shuffle")}
 
 
