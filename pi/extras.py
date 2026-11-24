@@ -92,9 +92,51 @@ def save():
 
 
 # ---------------------------------------------------------------- receiver (YNC)
+# Sound changes (DSP program, Straight, Enhancer, tone, DRC, ...) make the
+# RX-V671 rebuild its sound processing; network requests arriving during that
+# froze its network control (reproduced 2026-11-24). After a sound change the
+# bridge sends nothing for SOUND_QUIET_S, and sound changes are refused until
+# then. Several settings meant together go out back to back inside
+# sound_batch(), then one quiet window follows.
+SOUND_QUIET_S = float(os.environ.get("SPOTCAST_SOUND_QUIET_S", "30"))
+_SOUND_MARKERS = ("<Surround>", "<Sound_Video>", "<Scene_Load>")
+_batch = threading.local()
+
+
+class SoundBusy(ValueError):
+    pass
+
+
+def sound_wait():
+    """Seconds until the receiver accepts the next sound change (0 = now)."""
+    return max(0.0, sc.rx_stats.get("quiet_until", 0) - time.time())
+
+
+class sound_batch:
+    def __enter__(self):
+        if sound_wait() > 0:
+            raise SoundBusy(f"the receiver is still applying the last sound change; "
+                            f"try again in {sound_wait():.0f} s")
+        _batch.on = True
+
+    def __exit__(self, *exc):
+        _batch.on = False
+        if getattr(_batch, "sent", False):
+            _batch.sent = False
+            sc.rx_stats["quiet_until"] = time.time() + SOUND_QUIET_S
+            log.info("sound: changed; receiver left alone for %.0f s", SOUND_QUIET_S)
+
+
 def put(zone, inner):
+    sound = any(m in inner for m in _SOUND_MARKERS)
+    if sound and not getattr(_batch, "on", False):
+        with sound_batch():
+            return put(zone, inner)
     sc.invalidate_basic()
-    return sc.ync(f'<YAMAHA_AV cmd="PUT"><{zone}>{inner}</{zone}></YAMAHA_AV>')
+    r = sc.ync(f'<YAMAHA_AV cmd="PUT"><{zone}>{inner}</{zone}></YAMAHA_AV>')
+    if sound:
+        _batch.sent = True
+    return r
 
 
 def get(zone, inner):
@@ -111,8 +153,22 @@ def _db(xml, name):
     return int(m.group(1)) / 10 if m else None
 
 
+_sound_cache = {}
+
+
 def sound_state():
-    x = sc.basic_status() or ""
+    try:
+        x = sc.basic_status() or ""
+    except OSError:                      # quiet window / back-off: last known state
+        if _sound_cache:
+            return {**_sound_cache, "settling_s": round(sound_wait())}
+        raise
+    _sound_cache.clear()
+    _sound_cache.update(_sound_state(x))
+    return {**_sound_cache, "settling_s": round(sound_wait())}
+
+
+def _sound_state(x):
     return {
         "program": _tag(x, "Sound_Program"),
         "straight": _tag(x, "Straight") == "On",
@@ -124,6 +180,19 @@ def sound_state():
         "dialogue_lift": int(_tag(x, "Dialogue_Lift") or 0),
         "programs": SOUND_PROGRAMS,
     }
+
+
+def _sound_patch(key, val):
+    on = _onoff(val) == "On"
+    if key == "program":
+        return {"program": val, "straight": False}
+    if key in ("straight", "enhancer", "pure_direct", "drc", "cinema_3d"):
+        return {key: on}
+    if key in ("bass", "treble"):
+        return {f"{key}_db": max(-6.0, min(6.0, round(float(val) * 2) / 2))}
+    if key == "dialogue_lift":
+        return {"dialogue_lift": max(0, min(5, int(float(val))))}
+    return {}
 
 
 def _onoff(v):
@@ -220,13 +289,8 @@ def apply_scene(s):
     if s.get("input"):
         put("Main_Zone", f"<Input><Input_Sel>{html.escape(s['input'])}</Input_Sel></Input>")
         time.sleep(1)
-    if s.get("straight"):
-        set_sound("straight", True)
-    elif s.get("program"):
-        set_sound("program", s["program"])
-    for k in ("enhancer", "drc", "bass", "treble"):
-        if s.get(k) is not None:
-            set_sound(k, s[k])
+    # volume and Zone 2 first: after the sound settings the receiver is left
+    # alone for SOUND_QUIET_S
     if s.get("volume_db") is not None:
         sc.set_receiver_volume(s["volume_db"])
     z = s.get("zone2")
@@ -234,7 +298,23 @@ def apply_scene(s):
         zone2_set(power=False)
     elif z in ("on", "party"):
         zone2_set(power=True, input=s.get("input") or "PC" if z == "party" else None)
+    apply_sound_profile(s)
     sc.event("scene", name=s.get("name"))
+
+
+def apply_sound_profile(p):
+    """All sound settings of a scene/profile in one batch, then one quiet window."""
+    keys = ("enhancer", "drc", "pure_direct", "cinema_3d", "dialogue_lift", "bass", "treble")
+    if not (p.get("straight") or p.get("program") or any(p.get(k) is not None for k in keys)):
+        return
+    with sound_batch():
+        if p.get("straight"):
+            set_sound("straight", True)
+        elif p.get("program"):
+            set_sound("program", p["program"])
+        for k in keys:
+            if p.get(k) is not None:
+                set_sound(k, p[k])
 
 
 # ---------------------------------------------------------------- sources
@@ -789,6 +869,8 @@ def automations():
         time.sleep(20)
         try:
             pw, inp = sc.receiver_status()
+            if pw is None:                 # quiet window / unreachable: decide nothing
+                continue
             if pw != "On":
                 last_src = None
                 continue
@@ -803,19 +885,15 @@ def automations():
             # the source that is heard: a Pi source when the receiver is on PC,
             # otherwise the receiver input itself
             src = (st["active"] or "spotify") if inp == "PC" else inp
-            if src != last_src:
-                last_src = src
+            if src != last_src and sound_wait() == 0:
                 prof = (cfg.get("source_sound") or {}).get(src)
                 if cfg.get("source_sound_on") and prof:
+                    # not right after the receiver comes back: let it settle
+                    if time.time() - (sc.rx_stats.get("last_recovered") or 0) < 120:
+                        continue
                     log.info("source sound: %s -> %s", src, prof)
-                    if prof.get("straight"):
-                        set_sound("straight", True)
-                    elif prof.get("program"):
-                        set_sound("program", prof["program"])
-                    for k in ("enhancer", "drc", "pure_direct", "cinema_3d",
-                              "dialogue_lift", "bass", "treble"):
-                        if prof.get(k) is not None:
-                            set_sound(k, prof[k])
+                    apply_sound_profile(prof)
+                last_src = src
         except Exception as e:
             log.info("automations: %s", e)
 
@@ -1095,6 +1173,9 @@ def api(path, arg, body=None):
     if p == "sound":
         if arg("key"):
             set_sound(arg("key"), arg("value"))
+            # the receiver is now left alone: report what was set
+            _sound_cache.update(_sound_patch(arg("key"), arg("value")))
+            return {**_sound_cache, "settling_s": round(sound_wait())}
         return sound_state()
     if p == "inputs":
         return {"inputs": inputs()}

@@ -95,6 +95,8 @@ class Base(unittest.TestCase):
         extras.st["active"] = None
         extras.st["fade"] = None
         extras.st["sleep_until"] = 0
+        bridge.rx_stats["quiet_until"] = 0
+        extras._sound_cache.clear()
         extras.time.sleep = lambda s: None  # no real waiting
 
 
@@ -239,6 +241,39 @@ class Sound(Base):
     def test_bad_program_rejected(self):
         with self.assertRaises(ValueError):
             extras.set_sound("program", "Stadium Rock")
+
+
+class SoundQuietWindow(Base):
+    def test_sound_change_opens_quiet_window(self):
+        extras.set_sound("enhancer", "1")
+        self.assertGreater(extras.sound_wait(), 25)
+
+    def test_second_sound_change_refused_while_settling(self):
+        extras.set_sound("enhancer", "1")
+        with self.assertRaises(extras.SoundBusy):
+            extras.set_sound("straight", "1")
+        self.assertEqual(len(puts()), 1)            # nothing more reached the receiver
+
+    def test_volume_and_input_do_not_open_window(self):
+        extras.put("Main_Zone", "<Input><Input_Sel>TUNER</Input_Sel></Input>")
+        extras.put("Main_Zone", "<Volume><Mute>On</Mute></Volume>")
+        self.assertEqual(extras.sound_wait(), 0)
+
+    def test_scene_sends_all_sound_settings_in_one_batch_after_volume(self):
+        extras.apply_scene({"name": "Movie", "program": "Standard", "enhancer": False,
+                            "drc": True, "volume_db": -35})
+        sent = [x for x in bridge.sent if 'cmd="PUT"' in x or x.startswith("VOLUME")]
+        self.assertTrue(sent[0].startswith("VOLUME"))          # volume before sound
+        self.assertEqual(len([x for x in sent if "<Surround>" in x or "<Sound_Video>" in x]), 3)
+        self.assertGreater(extras.sound_wait(), 25)
+
+    def test_api_reports_what_was_set_without_asking_receiver(self):
+        extras._sound_cache.update({"program": "2ch Stereo", "straight": True})
+        before = len(bridge.sent)
+        r = extras.api("/api/x/sound", {"key": "program", "value": "Standard"}.get)
+        self.assertEqual((r["program"], r["straight"]), ("Standard", False))
+        self.assertGreater(r["settling_s"], 25)
+        self.assertEqual(len(bridge.sent), before + 1)       # just the PUT
 
 
 class Fades(Base):

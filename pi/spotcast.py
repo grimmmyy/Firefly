@@ -793,6 +793,12 @@ def rx_request(req, timeout=5, with_headers=False):
     with RX_GATE:
         if time.time() < rx_stats["retry_at"]:
             raise ReceiverBackoff(f"receiver backing off {rx_stats['retry_at'] - time.time():.0f}s")
+        if time.time() < rx_stats.get("quiet_until", 0):
+            # The RX-V671 rebuilds its DSP after a sound change; requests that
+            # arrive meanwhile have frozen its network control (reproduced
+            # 2026-11-24). Nothing is sent until it has settled.
+            raise ReceiverBackoff(f"receiver applying a sound change, "
+                                  f"{rx_stats['quiet_until'] - time.time():.0f}s")
         wait = RX_MIN_GAP - (time.monotonic() - _rx_last[0])
         if wait > 0:
             time.sleep(wait)
@@ -811,6 +817,7 @@ def rx_request(req, timeout=5, with_headers=False):
                          time.time() - rx_stats["first_fail"])
                 event("rx-recovered", down_s=int(time.time() - rx_stats["first_fail"]))
                 rx_stats["first_fail"] = None
+                rx_stats["last_recovered"] = time.time()
             rx_stats["ok"] += 1
             rx_stats["last_ok"] = time.time()
             rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "ok", what[:70])])[-40:]
