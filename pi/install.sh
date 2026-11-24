@@ -102,3 +102,9 @@ echo "Status page + app pairing code: http://$(hostname -I | awk '{print $1}'):8
 # receiver's 2011 network stack always sees one MAC per address.
 printf 'net.ipv4.conf.all.arp_ignore=1\nnet.ipv4.conf.all.arp_announce=2\nnet.ipv4.conf.default.arp_ignore=1\nnet.ipv4.conf.default.arp_announce=2\n' > /etc/sysctl.d/90-arp-flux.conf
 sysctl -q -p /etc/sysctl.d/90-arp-flux.conf
+
+# Download page mirror: pull each new nightly build from GitHub (public assets).
+install -m 644 "$HERE/firefly-dl-sync.service" "$HERE/firefly-dl-sync.timer" /etc/systemd/system/
+install -m 755 "$HERE/firefly-dl-sync.sh" /opt/spotcast/
+systemctl daemon-reload
+systemctl enable --now firefly-dl-sync.timer
