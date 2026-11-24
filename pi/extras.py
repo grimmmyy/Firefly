@@ -108,6 +108,8 @@ def sound_state():
         "pure_direct": _tag(re.sub(r"<Volume>.*?</Volume>", "", x), "Mode") == "On",
         "bass_db": _db(x, "Bass"), "treble_db": _db(x, "Treble"),
         "drc": _tag(x, "Adaptive_DRC") == "Auto",
+        "cinema_3d": _tag(x, "_3D_Cinema_DSP") == "Auto",
+        "dialogue_lift": int(_tag(x, "Dialogue_Lift") or 0),
         "programs": SOUND_PROGRAMS,
     }
 
@@ -137,6 +139,12 @@ def set_sound(key, val):
     elif key == "drc":            # "night mode"
         v = "Auto" if _onoff(val) == "On" else "Off"
         put("Main_Zone", f"<Sound_Video><Adaptive_DRC>{v}</Adaptive_DRC></Sound_Video>")
+    elif key == "cinema_3d":
+        v = "Auto" if _onoff(val) == "On" else "Off"
+        put("Main_Zone", f"<Surround><_3D_Cinema_DSP>{v}</_3D_Cinema_DSP></Surround>")
+    elif key == "dialogue_lift":
+        n = max(0, min(5, int(float(val))))
+        put("Main_Zone", f"<Surround><Dialogue_Lift>{n}</Dialogue_Lift></Surround>")
     elif key == "scene":          # the receiver's own Scene 1-4
         if not re.fullmatch(r"Scene [1-4]", val):
             raise ValueError("scene must be 'Scene 1'..'Scene 4'")

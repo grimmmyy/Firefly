@@ -261,6 +261,29 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
         value: sound['drc'] == true,
         onChanged: (v) => _sound('drc', v),
       ),
+      SwitchListTile(
+        title: const Text('Pure Direct'),
+        subtitle: const Text('Bypass all processing for the cleanest stereo'),
+        value: sound['pure_direct'] == true,
+        onChanged: (v) => _sound('pure_direct', v),
+      ),
+      SwitchListTile(
+        title: const Text('CINEMA DSP 3D'),
+        subtitle: const Text('Height effect for sound programs'),
+        value: sound['cinema_3d'] == true,
+        onChanged: (v) => _sound('cinema_3d', v),
+      ),
+      ListTile(
+        title: Text('Dialogue Lift ${(sound['dialogue_lift'] as num?)?.toInt() ?? 0}'),
+        subtitle: Slider(
+          min: 0,
+          max: 5,
+          divisions: 5,
+          value: ((sound['dialogue_lift'] as num?) ?? 0).toDouble().clamp(0, 5),
+          onChanged: (n) => setState(() => sound = {...sound, 'dialogue_lift': n.round()}),
+          onChangeEnd: (n) => _sound('dialogue_lift', n.round()),
+        ),
+      ),
       _toneSlider('Bass', 'bass', (sound['bass_db'] as num?)?.toDouble()),
       _toneSlider('Treble', 'treble', (sound['treble_db'] as num?)?.toDouble()),
       Padding(
