@@ -135,7 +135,7 @@ class _ReceiverBrowsePageState extends State<ReceiverBrowsePage> {
   @override
   void initState() {
     super.initState();
-    _do('select_input');
+    _do(null);              // look first; the receiver switches when you open or play something
   }
 
   Future<void> _do(String? action, [String? value]) async {

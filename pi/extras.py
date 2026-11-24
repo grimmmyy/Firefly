@@ -43,11 +43,11 @@ DEFAULTS = {
     "airplay_volume": True,           # AirPlay slider moves the receiver volume
     "loudness": False, "eq_on": False, "eq": [0.0] * 15,
     "scenes": [
-        {"name": "Music", "input": "PC", "program": "2ch Stereo", "straight": False,
+        {"name": "Music Scene", "input": "PC", "program": "2ch Stereo", "straight": False,
          "enhancer": True, "drc": False},
         {"name": "Movie", "input": "HDMI1", "program": "Standard", "straight": False,
          "enhancer": False, "drc": False},
-        {"name": "Night", "drc": True, "volume_db": -45},
+        {"name": "Night Scene", "drc": True, "volume_db": -45},
     ],
     "schedules": [],
     "dlna_uuid": None,
@@ -702,27 +702,42 @@ def run_schedule(s):
         sleep_fade(float(s.get("fade_min", 20)))
 
 
-def fade_volume(start, target, minutes, then=None):
+def fade_volume(start, target, minutes, then=None, on_stop=None):
     """Move the receiver volume start->target in 0.5 dB steps over `minutes`.
-    A newer fade (or sleep_cancel) stops this one."""
+    Stops (calling on_stop) when a newer fade or sleep_cancel replaces it, or
+    when someone moves the volume by hand (app, remote, Alexa)."""
     token = object()
     st["fade"] = token
     steps = max(1, int(abs(target - start) * 2))
     gap = max(2.0, minutes * 60 / steps)          # at least 2 s between requests
 
     def run():
-        for i in range(1, steps + 1):
-            time.sleep(gap)
-            if st["fade"] is not token:
-                return
-            try:
-                sc.set_receiver_volume(start + (target - start) * i / steps)
-            except Exception as e:
-                log.info("fade: %s", e)
-        if st["fade"] is token:
-            st["fade"] = None
-            if then:
-                then()
+        last = start
+        try:
+            for i in range(1, steps + 1):
+                time.sleep(gap)
+                if st["fade"] is not token:
+                    log.info("fade: replaced")
+                    if on_stop:
+                        on_stop()
+                    return
+                now, _ = sc.receiver_volume()
+                if now is not None and abs(now - last) > 1.0:
+                    log.info("fade: volume moved by hand (%.1f -> %.1f), stopping", last, now)
+                    st["fade"] = None
+                    if on_stop:
+                        on_stop()
+                    return
+                try:
+                    last = sc.set_receiver_volume(start + (target - start) * i / steps)
+                except Exception as e:
+                    log.info("fade: %s", e)
+            if st["fade"] is token:
+                st["fade"] = None
+                if then:
+                    then()
+        except Exception as e:
+            log.info("fade: %s", e)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -733,13 +748,25 @@ def sleep_fade(minutes):
         return
 
     def done():
+        st["sleep_until"] = 0
         _pause_others("none")
         sc.hand_back_now()
+        # restore the level first (the receiver may ignore volume in standby),
+        # muted so the jump back up is not heard
+        put("Main_Zone", "<Volume><Mute>On</Mute></Volume>")
+        sc.set_receiver_volume(cur)                 # next time starts at the old level
         put("Main_Zone", "<Power_Control><Power>Standby</Power></Power_Control>")
         time.sleep(3)
-        sc.set_receiver_volume(cur)                 # next time starts at the old level
+        try:
+            put("Main_Zone", "<Volume><Mute>Off</Mute></Volume>")
+        except Exception:
+            pass
+
+    def stopped():
+        st["sleep_until"] = 0
+        log.info("sleep: cancelled")
     st["sleep_until"] = time.time() + minutes * 60
-    fade_volume(cur, max(-80.0, cur - 30), minutes, then=done)
+    fade_volume(cur, max(-80.0, cur - 30), minutes, then=done, on_stop=stopped)
     log.info("sleep: fading out over %.0f min", minutes)
 
 
@@ -903,7 +930,10 @@ def _b(v):
 # The receiver's own FM/AM tuner, its front USB port and its media-server
 # client ("SERVER" input, YNC tag "PC"). Switching to one of them makes the
 # receiver the active source: the Pi's streams are paused.
-RX_SOURCES = {"tuner": ("TUNER", "Tuner"), "usb": ("USB", "USB"), "server": ("SERVER", "PC")}
+# The media-server client is the receiver's "PC" input, the same input the
+# Pi streams to; switching to it pauses the Pi's sources first, so the
+# watchdog in spotcast.py does not take it back.
+RX_SOURCES = {"tuner": ("TUNER", "Tuner"), "usb": ("USB", "USB"), "server": ("PC", "PC")}
 
 
 def rx_select(src):
@@ -912,11 +942,13 @@ def rx_select(src):
     if pw != "On":
         sc.power_on()
         time.sleep(4)
-    put("Main_Zone", f"<Input><Input_Sel>{inp}</Input_Sel></Input>")
     if st["active"] != "receiver":
         st["active"], st["since"] = "receiver", time.time()
         history_add("receiver " + src)
-        threading.Thread(target=_pause_others, args=("receiver",), daemon=True).start()
+        _pause_others("receiver")        # before switching: no fight with the watchdog
+    _, cur = sc.receiver_status()
+    if cur != inp:
+        put("Main_Zone", f"<Input><Input_Sel>{inp}</Input_Sel></Input>")
 
 
 def tuner_state():
@@ -1006,6 +1038,8 @@ def browse_do(src, action, value=None):
     elif action == "page":                      # first line of the wanted page
         lc(f"<Jump_Line>{max(1, int(value))}</Jump_Line>")
     elif action in ("Play", "Stop", "Pause", "Skip Fwd", "Skip Rev"):
+        if action == "Play":
+            rx_select(src)
         pc(f"<Playback>{action}</Playback>")
     elif action == "repeat" and value in ("Off", "Single", "All"):
         pc(f"<Play_Mode><Repeat>{value}</Repeat></Play_Mode>")
@@ -1013,12 +1047,14 @@ def browse_do(src, action, value=None):
         pc(f"<Play_Mode><Shuffle>{value}</Shuffle></Play_Mode>")
     else:
         raise ValueError("unknown browse action")
-    for _ in range(10):                         # the receiver answers "Busy" while it reads
-        time.sleep(0.4)
-        s = browse_state(src)
-        if not s["busy"]:
-            return s
-    return s
+    # the receiver answers "Busy" while it reads the folder; poll only the
+    # list status (one request per 0.6 s, at most 8), then read everything once
+    for _ in range(8):
+        time.sleep(0.6)
+        li = get(tag, "<List_Info>GetParam</List_Info>") or ""
+        if _tag(li, "Menu_Status") != "Busy":
+            break
+    return browse_state(src)
 
 
 INPUT_TAGS = {"HDMI1": "HDMI_1", "HDMI2": "HDMI_2", "HDMI3": "HDMI_3", "HDMI4": "HDMI_4",
