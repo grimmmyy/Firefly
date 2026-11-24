@@ -288,7 +288,7 @@ class _HealthStrip extends StatelessWidget {
               Icon(Icons.power_off, color: Colors.redAccent),
               SizedBox(width: 10),
               Expanded(
-                child: Text('The receiver's network control is frozen. Unplug it from the '
+                child: Text("The receiver's network control is frozen. Unplug it from the "
                     'wall for 30 seconds, then plug it back in.'),
               ),
             ]),
