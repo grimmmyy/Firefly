@@ -33,11 +33,17 @@ esac
 echo "==> packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  python3 ffmpeg curl qrencode pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 nftables >/dev/null
+  python3 ffmpeg curl qrencode pipewire pipewire-pulse wireplumber pulseaudio-utils iproute2 nftables   bluez bluez-tools gmediarender swh-plugins gstreamer1.0-tools gstreamer1.0-plugins-good   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-pulseaudio >/dev/null
+systemctl disable --now gmediarender 2>/dev/null || true      # spotcast starts it
+
+if [ "${SKIP_AIRPLAY2:-0}" != 1 ] && ! /usr/local/bin/shairport-sync -V 2>/dev/null | grep -q AirPlay2; then
+  echo "==> AirPlay 2 (building from source, ~5 min)"
+  sh "$HERE/build-airplay2.sh" || echo "AirPlay 2 build failed; continuing without AirPlay"
+fi
 
 echo "==> service user"
 id spotcast >/dev/null 2>&1 || useradd -r -m -d /var/lib/spotcast-user -s /usr/sbin/nologin spotcast
-usermod -aG audio spotcast
+usermod -aG audio,bluetooth spotcast
 loginctl enable-linger spotcast
 UID_SC=$(id -u spotcast)
 
@@ -52,6 +58,8 @@ echo "==> files"
 install -d /opt/spotcast /etc/spotcast /var/lib/spotcast
 install -m 755 "$HERE/spotcast.py" /opt/spotcast/spotcast.py
 install -m 755 "$HERE/onevent.sh" /opt/spotcast/onevent.sh
+install -m 644 "$HERE/extras.py" /opt/spotcast/extras.py
+install -m 755 "$HERE/onvolume.sh" /opt/spotcast/onvolume.sh
 install -m 755 "$HERE/spotcast-hide.sh" /opt/spotcast/spotcast-hide.sh
 install -m 755 "$HERE/soloist-update" /usr/local/sbin/soloist-update
 sed -i "s#/soloist_release_arm64.tar.gz#/soloist_release_${SOLOIST_ARCH}.tar.gz#" /usr/local/sbin/soloist-update
@@ -79,9 +87,10 @@ echo "==> systemd"
 sed "s/997/$UID_SC/g" "$HERE/spotcast.service" > /etc/systemd/system/spotcast.service
 install -m 644 "$HERE/soloist-update.service" /etc/systemd/system/
 install -m 644 "$HERE/soloist-update.timer" /etc/systemd/system/
+install -m 644 "$HERE/spotcast-bt-agent.service" /etc/systemd/system/
 systemctl daemon-reload
 sudo -u spotcast XDG_RUNTIME_DIR="/run/user/$UID_SC" systemctl --user restart pipewire pipewire-pulse wireplumber || true
-systemctl enable --now spotcast soloist-update.timer
+systemctl enable --now spotcast soloist-update.timer spotcast-bt-agent
 
 echo
 echo "Done. In Spotify (on the same Wi-Fi), pick \"Living Room - Add me\" to link your account."

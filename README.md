@@ -77,6 +77,34 @@ flowchart LR
   multicast entitlements), bridge address, update status
 - Mini player and full-screen Now Playing on every screen
 
+### Modern-receiver features (Receiver tab)
+
+The Pi makes the 2011 RX-V671 behave like a current streaming receiver, with no extra hardware:
+
+- **AirPlay 2** (iPhone, iPad, Mac, Apple Music), built from source by `pi/build-airplay2.sh`.
+  The AirPlay volume slider moves the receiver's real volume.
+- **Cast (DLNA)**: appears as *Living Room (Pi cast)* in apps that cast to DLNA renderers.
+- **Bluetooth**: pairs as *Living Room Speaker*, no PIN; "Pair a phone" opens a 3-minute window.
+- **Internet radio played by the Pi**, so it works with everything below.
+- **Last source wins**: the newest source to start is heard; the others are muted and paused.
+- **Auto on / auto standby**: any source powers the receiver on and switches it to PC; after
+  20 minutes of silence it goes back to what it was doing (or standby).
+- **Sound**: sound program (DSP), Straight, Compressed Music Enhancer, night mode (Adaptive
+  DRC), bass and treble, the receiver's own scenes 1-4.
+- **Scenes**: one tap sets input, sound, volume and Zone 2. Each scene is also an Alexa device
+  (`alexa_local.py`) for voice and routines, along with *Night Mode* and *Zone 2*.
+- **Zone 2**: power, input and volume for a second room.
+- **Loudness levelling and room EQ**: LADSPA filters in PipeWire in front of the stream. *Measure
+  my room* plays a tone per band through the receiver and measures it with the phone's
+  microphone, then applies gentle corrections (Android, iOS).
+- **Schedules**: wake up to Spotify or a radio station with a volume fade, timed scenes, timed
+  off.
+- **History**: listening time per source per day, recent tracks and problems, also on the
+  status page.
+
+Pi API for all of the above: `/api/x/{status,sound,zone2,inputs,sources,bt,radio,dsp,`
+`roomeq/start,roomeq/apply,scenes,schedules,history}`.
+
 ## Requirements
 
 | | |

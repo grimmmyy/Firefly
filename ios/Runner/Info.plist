@@ -44,6 +44,8 @@
     <true/>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Measure your room through the microphone to tune the receiver's EQ.</string>
     <key>NSCameraUsageDescription</key>
     <string>Scan the pairing code shown on the speaker bridge page.</string>
     <key>NSLocalNetworkUsageDescription</key>

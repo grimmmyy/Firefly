@@ -7,6 +7,7 @@ import 'home_screen.dart';
 import 'library_screen.dart';
 import 'now_playing_sheet.dart';
 import 'radio_screen.dart';
+import 'receiver_screen.dart';
 import 'settings_screen.dart';
 import 'setup_screen.dart';
 
@@ -66,6 +67,7 @@ class _ShellState extends State<Shell> {
     final a = widget.app;
     final screens = [
       HomeScreen(app: a),
+      ReceiverScreen(app: a),
       RadioScreen(app: a),
       LibraryScreen(app: a),
       SettingsScreen(app: a),
@@ -87,6 +89,10 @@ class _ShellState extends State<Shell> {
                   icon: Icon(Icons.home_outlined),
                   selectedIcon: Icon(Icons.home),
                   label: 'Home'),
+              NavigationDestination(
+                  icon: Icon(Icons.speaker_outlined),
+                  selectedIcon: Icon(Icons.speaker),
+                  label: 'Receiver'),
               NavigationDestination(
                   icon: Icon(Icons.radio_outlined),
                   selectedIcon: Icon(Icons.radio),

@@ -1003,7 +1003,7 @@ def enforce_single_output():
         if cur is None or cur.proc is None or cur.proc.poll() is not None:
             return
         for idx, sl, live, block in streams:
-            want = sl is not cur
+            want = sl is not cur or (extras is not None and extras.mute_spotify())
             muted = "Mute: yes" in block
             if want != muted:
                 sh_out(["pactl", "set-sink-input-mute", idx, "1" if want else "0"])
@@ -1679,6 +1679,7 @@ def api_status():
         "tailscale_ip": tailscale_ip(),
         "alerts": {"ntfy": bool(NTFY_TOPIC), "discord": bool(DISCORD_WEBHOOK),
                    "heartbeat": bool(HEARTBEAT_URL)},
+        "extras": extras.status() if extras else None,
         "upnp_events": {"subscribed": upnp_subscribed(), "state": upnp["state"],
                         "age_s": int(time.time() - upnp["t"]) if upnp["t"] else None},
     }
@@ -1985,6 +1986,7 @@ def _tone_wav(seconds=2.0, hz=660.0):
 
 
 TONE = None
+extras = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2066,6 +2068,15 @@ class Handler(BaseHTTPRequestHandler):
             elif p.path == "/api/update":
                 subprocess.Popen(["sudo", "-n", "/usr/local/sbin/soloist-update"])
                 out = {"ok": True}
+            elif p.path.startswith("/api/x/") and extras:
+                body = None
+                if self.command == "POST":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(n) or b"null") if n else None
+                try:
+                    out = extras.api(p.path, arg, body)
+                except KeyError:
+                    code, out = 404, {"error": "not found"}
             elif p.path == "/api/control":
                 cmd = arg("cmd")
                 if cmd not in ("pause", "play", "next", "prev"):
@@ -2131,6 +2142,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"error":"pairing token required"}')
         return True
+
+    def do_POST(self):
+        p = urllib.parse.urlparse(self.path)
+        if self._remote_denied(p):
+            return
+        if p.path.startswith("/api/x/"):
+            self.api(p)
+        else:
+            self.send_response(404); self.end_headers()
 
     def do_GET(self):
         global TONE
@@ -2226,6 +2246,7 @@ code{{color:#ddd}}</style>
 <ul>{rows(devices.unknown, 'ignore', 'ignore')}</ul>
 <h3>Registered devices</h3><ul>{rows(devices.reg, 'forget', 'forget')}</ul>
 <h3>Ignored</h3><ul>{rows(devices.ignored, 'forget', 'un-ignore')}</ul>
+{extras.html_section() if extras else ''}
 {health_html()}""".encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2301,6 +2322,15 @@ def main():
     threading.Thread(target=receiver_finder, daemon=True).start()
     threading.Thread(target=netwatch, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
+    global extras
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import extras as _extras
+        extras = _extras
+        extras.start()
+    except Exception as e:
+        log.exception("extras failed to start: %s", e)
+        extras = None
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:

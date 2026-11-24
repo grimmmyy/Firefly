@@ -12,6 +12,11 @@ Each "light" maps to a receiver action through spotcast's /api:
             (Alexa's own "pause"/"stop" only reach the Echo, which no longer
             plays once the music has moved to the receiver)
 
+  Night Mode on/off  -> receiver Adaptive DRC
+  Zone 2    on/off, dim % -> second-room power and volume
+  <scene>   on      -> apply that Firefly scene (one device per scene; use them
+                       in Alexa routines)
+
 "Alexa, discover devices" once, then: "Alexa, turn on the receiver",
 "Alexa, set the receiver to 40 percent", "Alexa, turn on TV mode".
 """
@@ -115,11 +120,67 @@ def music_set(on=None, bri=None):
         api("control", cmd="play" if on else "pause")
 
 
-DEVICES = {
+def night_get():
+    try:
+        return {"on": bool(api("x/sound").get("drc")), "bri": 254}
+    except Exception:
+        return {"on": False, "bri": 254}
+
+
+def night_set(on=None, bri=None):
+    if on is not None:
+        api("x/sound", key="drc", value="1" if on else "0")
+
+
+def zone2_get():
+    try:
+        z = api("x/zone2")
+    except Exception:
+        return {"on": False, "bri": 1}
+    db = z.get("volume_db")
+    bri = max(1, min(254, round((db + 80.5) / 70.5 * 254))) if db is not None else 1
+    return {"on": z.get("power") == "On", "bri": bri}
+
+
+def zone2_set(on=None, bri=None):
+    if on is not None:
+        api("x/zone2", power="1" if on else "0")
+    elif bri is not None:
+        api("x/zone2", volume_db=f"{-80.5 + bri / 254 * 70.5:.1f}")
+
+
+def scene_dev(name):
+    def g():
+        return {"on": False, "bri": 254}         # scenes are triggers, never "on"
+
+    def s(on=None, bri=None):
+        if on:
+            api("x/scenes", apply=name)
+    return {"name": name, "get": g, "set": s, "dim": False}
+
+
+STATIC = {
     "1": {"name": "Receiver", "get": receiver_get, "set": receiver_set, "dim": True},
     "2": {"name": "TV Mode", "get": tv_get, "set": tv_set, "dim": False},
     "3": {"name": "Music", "get": music_get, "set": music_set, "dim": False},
+    "4": {"name": "Night Mode", "get": night_get, "set": night_set, "dim": False},
+    "5": {"name": "Zone 2", "get": zone2_get, "set": zone2_set, "dim": True},
 }
+_dev_cache = {"t": 0.0, "d": dict(STATIC)}
+
+
+def devices():
+    """Static devices + one per Firefly scene ("Alexa, turn on Movie"), ids 20+.
+    Usable in Alexa routines like any plug."""
+    if time.time() - _dev_cache["t"] > 30:
+        d = dict(STATIC)
+        try:
+            for i, sc in enumerate(api("x/scenes").get("scenes", [])[:30]):
+                d[str(20 + i)] = scene_dev(sc["name"])
+        except Exception:
+            pass
+        _dev_cache.update(t=time.time(), d=d)
+    return _dev_cache["d"]
 
 
 def light_json(i, d):
@@ -188,12 +249,12 @@ class H(BaseHTTPRequestHandler):
         parts = p.split("/")       # ['', 'api', user, 'lights', id]
         if len(parts) >= 3 and parts[1] == "api":
             if len(parts) == 3:
-                return self.send({"lights": {i: light_json(i, d) for i, d in DEVICES.items()}})
+                return self.send({"lights": {i: light_json(i, d) for i, d in devices().items()}})
             if parts[3] == "lights":
                 if len(parts) == 4:
-                    return self.send({i: light_json(i, d) for i, d in DEVICES.items()})
-                if parts[4] in DEVICES:
-                    return self.send(light_json(parts[4], DEVICES[parts[4]]))
+                    return self.send({i: light_json(i, d) for i, d in devices().items()})
+                if parts[4] in devices():
+                    return self.send(light_json(parts[4], devices()[parts[4]]))
             if parts[3] == "config":
                 return self.send({"name": "Firefly", "bridgeid": BRIDGE_ID, "mac": ":".join(
                     MAC[i:i + 2] for i in range(0, 12, 2)), "modelid": "BSB002",
@@ -209,8 +270,8 @@ class H(BaseHTTPRequestHandler):
     def do_PUT(self):
         parts = self.path.rstrip("/").split("/")
         data = self.body()
-        if len(parts) >= 6 and parts[3] == "lights" and parts[4] in DEVICES and parts[5] == "state":
-            i, d = parts[4], DEVICES[parts[4]]
+        if len(parts) >= 6 and parts[3] == "lights" and parts[4] in devices() and parts[5] == "state":
+            i, d = parts[4], devices()[parts[4]]
             on = data.get("on")
             bri = data.get("bri") if d["dim"] else None
             log.info("alexa -> %s on=%s bri=%s", d["name"], on, bri)
@@ -258,5 +319,5 @@ def ssdp():
 if __name__ == "__main__":
     threading.Thread(target=ssdp, daemon=True).start()
     log.info("alexa-local Hue bridge on %s:%d (devices: %s)", IP, PORT,
-             ", ".join(d["name"] for d in DEVICES.values()))
+             ", ".join(d["name"] for d in devices().values()))
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

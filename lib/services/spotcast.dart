@@ -298,6 +298,38 @@ class SpotcastController extends ChangeNotifier {
   Future<void> unlinkAccount(int slot) => _call('account/remove', {'slot': '$slot'});
   Future<void> armFollow() => _call('follow', {'on': '1'});
 
+  // ------------------------------------------------- receiver extras (/api/x)
+  /// Sources, sound, Zone 2, DSP, scenes, schedules, history on the Pi.
+  Map get extras => (status?['extras'] ?? const {}) as Map;
+  String? get activeSource => extras['active'] as String?;
+  String? get activeLabel => extras['label'] as String?;
+  Map get extrasNowPlaying => (extras['now_playing'] ?? const {}) as Map;
+
+  Future<Map<String, dynamic>?> x(String path, [Map<String, String>? q]) async {
+    final r = await _get('x/$path', q);
+    unawaited(refresh());
+    return r;
+  }
+
+  Future<Map<String, dynamic>?> xPost(String path, Object body) async {
+    if (host == null) return null;
+    try {
+      final r = await http
+          .post(Uri.http('$host:8090', '/api/x/$path'),
+              headers: {..._headers, 'Content-Type': 'application/json'},
+              body: jsonEncode(body))
+          .timeout(const Duration(seconds: 20));
+      return jsonDecode(r.body) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Internet radio played by the Pi (so it takes part in last-source-wins,
+  /// schedules and the EQ).
+  Future<bool> playRadioOnBridge(String url, String name) async =>
+      (await x('radio', {'url': url, 'name': name}))?['radio'] != null;
+
   /// Optimistic local volume while dragging; sent when the drag settles.
   void previewVolume(double db) {
     _volumeHoldUntil = DateTime.now().add(const Duration(seconds: 3));
