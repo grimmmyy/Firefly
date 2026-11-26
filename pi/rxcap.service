@@ -6,7 +6,7 @@ After=network-online.target
 # Control traffic only (the audio stream on 8090 is excluded), plus SSDP, mDNS,
 # ARP and DHCP; 8 x 25 MB keeps several days. -U writes each packet at once so
 # freeze reports (freezelog.py) include the last seconds.
-ExecStart=/usr/bin/tcpdump -U -Z root -i any -n -s 512 -C 25 -W 8 -w /var/log/rxcap/rx.pcap (host 192.168.1.7 and not port 8090) or udp port 1900 or udp port 5353 or arp or udp port 67 or udp port 68
+ExecStart=/usr/bin/tcpdump -U -Z root -i eth0 -n -s 512 -C 25 -W 8 -w /var/log/rxcap/rx.pcap (ether host 00:a0:de:86:51:6f and not port 8090) or udp port 1900 or udp port 5353 or arp or udp port 67 or udp port 68
 Restart=always
 
 [Install]
