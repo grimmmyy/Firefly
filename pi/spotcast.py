@@ -821,11 +821,15 @@ def rx_request(req, timeout=5, with_headers=False):
             rx_latency_add(time.monotonic() - t0)
             if req.data and any(h in req.data for h in _HEAVY):
                 _rx_settle[0] = time.monotonic() + RX_SETTLE_S
+                if freezelog:
+                    freezelog.mark("heavy_cmd", what)
             rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
             if rx_stats["first_fail"]:
                 log.info("receiver control recovered after %ds down",
                          time.time() - rx_stats["first_fail"])
                 event("rx-recovered", down_s=int(time.time() - rx_stats["first_fail"]))
+                if freezelog:
+                    freezelog.mark_recovered(time.time() - rx_stats["first_fail"])
                 rx_stats["first_fail"] = None
                 rx_stats["last_recovered"] = time.time()
             rx_stats["ok"] += 1
@@ -845,6 +849,8 @@ def rx_request(req, timeout=5, with_headers=False):
                 rx_stats["first_fail"] = time.time()
                 # keep the requests that led up to the freeze for diagnosis
                 event("rx-down", error=str(e)[:120], last_requests=rx_stats["log"][-15:])
+                if freezelog:
+                    freezelog.report(str(e))
                 log.info("receiver control FAILED (%s); last requests logged", e)
             raise
         finally:
@@ -2040,6 +2046,7 @@ def _tone_wav(seconds=2.0, hz=660.0):
 
 TONE = None
 extras = None
+freezelog = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2375,9 +2382,14 @@ def main():
     threading.Thread(target=receiver_finder, daemon=True).start()
     threading.Thread(target=netwatch, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
-    global extras
+    global extras, freezelog
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import freezelog as _freezelog
+        freezelog = _freezelog
+    except Exception as e:
+        log.exception("freeze log unavailable: %s", e)
+    try:
         import extras as _extras
         extras = _extras
         extras.start()

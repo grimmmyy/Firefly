@@ -114,3 +114,12 @@ install -m 755 "$HERE/spotcast-backup.sh" /opt/spotcast/
 install -m 644 "$HERE/spotcast-backup.service" "$HERE/spotcast-backup.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now spotcast-backup.timer
+
+# Freeze diagnosis: rolling capture of the receiver's control traffic; each
+# freeze then leaves a report in /var/lib/spotcast-user/freezes (freezelog.py).
+install -m 644 "$HERE/freezelog.py" /opt/spotcast/freezelog.py
+command -v tcpdump >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcpdump
+mkdir -p /var/log/rxcap
+install -m 644 "$HERE/rxcap.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now rxcap.service

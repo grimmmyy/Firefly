@@ -124,6 +124,8 @@ class sound_batch:
         if getattr(_batch, "sent", False):
             _batch.sent = False
             sc.rx_stats["quiet_until"] = time.time() + SOUND_QUIET_S
+            if getattr(sc, "freezelog", None):
+                sc.freezelog.mark("sound_change")
             log.info("sound: changed; receiver left alone for %.0f s", SOUND_QUIET_S)
 
 
@@ -1348,6 +1350,9 @@ def api(path, arg, body=None):
             back, st["duck_from"] = st["duck_from"], None
             sc.set_receiver_volume(back)            # restore in one step
         return {"ducked": st.get("duck_from") is not None}
+    if p == "freezes":
+        fl = getattr(sc, "freezelog", None)
+        return {"freezes": fl.reports(int(arg("limit") or 20)) if fl else []}
     if p == "health":
         return {"latency": sc.rx_latency_report(), "rx_ok": sc.rx_stats["ok"],
                 "rx_fail": sc.rx_stats["fail"]}
