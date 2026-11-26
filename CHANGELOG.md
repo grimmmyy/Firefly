@@ -19,6 +19,10 @@
   changes, response times, network floods and scans, and a 10-minute capture,
   plus ranked likely causes. In the app: Receiver → Freeze history.
 - Alerts within about a minute of a freeze (ntfy), and a red notice on Home.
+- Freeze rescue (`pi/rescue.py`): 90 s into a freeze the bridge tries the
+  receiver's other control port (50000): a query, a network-player restart, then
+  a standby cycle if nobody is using it. Each step is recorded. Not yet seen
+  against a real freeze.
 - Still open: a slow freeze after 5-6 idle hours. Under test: the Pi cast (DLNA)
   service, which announced itself every ~14 s; a rebuilt version announces
   every 30 min (`pi/build-gmrender.sh`).

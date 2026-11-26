@@ -2421,6 +2421,11 @@ def main():
         log.exception("extras failed to start: %s", e)
         extras = None
     try:
+        import rescue
+        rescue.start()
+    except Exception as e:
+        log.exception("freeze rescue unavailable: %s", e)
+    try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:
             alert("pi-reboot", f"Pi rebooted {int(up // 60)} min ago; speaker is back online",
