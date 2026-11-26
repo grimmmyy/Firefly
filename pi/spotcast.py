@@ -1889,7 +1889,9 @@ def receiver_finder():
                   every=0)
             time.sleep(60)
         else:
-            time.sleep(90)
+            # a cable reset brings it back with a new DHCP lease within a minute;
+            # look again soon (one SSDP search, no traffic to the receiver itself)
+            time.sleep(15)
 
 
 def netwatch():
