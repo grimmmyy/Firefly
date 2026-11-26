@@ -1153,8 +1153,26 @@ prev_receiver = {}
 _basic = {"t": 0.0, "xml": None}
 
 
+# While nothing plays, the receiver's status is re-read at most every
+# RX_IDLE_POLL_S (state changes made through the bridge invalidate it at once).
+# Test 2026-11-26: the receiver froze idle with only status polls (~3/min).
+RX_IDLE_POLL_S = float(os.environ.get("SPOTCAST_RX_IDLE_POLL_S", "300"))
+
+
+def bridge_idle():
+    try:
+        if any(x.playing for x in slots.slots) or wav_hub.count():
+            return False
+        return not (extras and extras.st.get("active"))
+    except Exception:
+        return False
+
+
 def basic_status(max_age=4.0):
-    """Main_Zone Basic_Status, shared by everything for max_age seconds."""
+    """Main_Zone Basic_Status, shared by everything for max_age seconds
+    (RX_IDLE_POLL_S while nothing is playing)."""
+    if _basic["xml"] is not None and bridge_idle():
+        max_age = max(max_age, RX_IDLE_POLL_S)
     if time.time() - _basic["t"] < max_age and _basic["xml"] is not None:
         return _basic["xml"]
     try:
