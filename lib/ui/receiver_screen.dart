@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
+import 'freeze_history_page.dart';
 import 'receiver_automations.dart';
 import 'receiver_sources.dart';
 import 'room_eq_page.dart';
@@ -37,6 +38,47 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
 
   AppState get a => widget.app;
 
+  // Sub-pages show cards built by this State; they rebuild whenever it does.
+  final _rev = ValueNotifier(0);
+
+  @override
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    _rev.value++;
+  }
+
+  void _open(String title, List<Widget> Function() children) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => Scaffold(
+          appBar: AppBar(title: Text(title)),
+          body: ValueListenableBuilder<int>(
+            valueListenable: _rev,
+            builder: (_, __, ___) => RefreshIndicator(
+              onRefresh: _reload,
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+                children: children(),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _more(IconData icon, String title, String subtitle, VoidCallback onTap) => Card(
+        margin: const EdgeInsets.only(bottom: 8),
+        child: ListTile(
+          leading: Icon(icon),
+          title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+          subtitle: Text(subtitle),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: onTap,
+        ),
+      );
+
   @override
   void initState() {
     super.initState();
@@ -48,6 +90,7 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
   void dispose() {
     a.spot.removeListener(_onSpot);
     _eqDebounce?.cancel();
+    _rev.dispose();
     super.dispose();
   }
 
@@ -104,7 +147,6 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
     }
     final ex = s.extras;
     final src = (ex['sources'] ?? const {}) as Map;
-    final dsp = (ex['dsp'] ?? const {}) as Map;
     return RefreshIndicator(
       onRefresh: _reload,
       child: ListView(
@@ -119,16 +161,34 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
                   width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
           ]),
           const SizedBox(height: 8),
+          // everyday: what's playing, how it sounds, one-tap scenes
           _nowPlaying(ex),
-          _sources(src),
-          _receiverSourcesCard(),
           _soundCard(),
           _scenesCard(),
-          _Section(title: 'Automations', children: [AutomationsCard(app: a)]),
-          _zone2Card(),
-          _dspCard(dsp),
-          _schedulesCard(),
-          _historyCard(),
+          const SizedBox(height: 8),
+          _more(Icons.radio, 'FM, USB & media server',
+              'Tuner presets, browse a USB stick, rename inputs',
+              () => _open('On the receiver', () => [_receiverSourcesCard()])),
+          _more(Icons.bedtime_outlined, 'Sleep, quiet hours & automations',
+              'Sleep timer, volume cap at night, sound per source, call ducking',
+              () => _open('Automations',
+                  () => [_Section(title: 'Automations', children: [AutomationsCard(app: a)])])),
+          _more(Icons.alarm, 'Schedules',
+              schedules.isEmpty ? 'Wake-up, sleep and timed scenes' : '${schedules.length} set',
+              () => _open('Schedules', () => [_schedulesCard()])),
+          _more(Icons.cast_connected, 'AirPlay, Bluetooth & cast',
+              'Turn sources on or off, pair a phone', () => _open('Sources', () => [_sources(src)])),
+          _more(Icons.speaker_group_outlined, 'Zone 2', zone2['power'] == 'On' ? 'On' : 'Second room',
+              () => _open('Zone 2', () => [_zone2Card()])),
+          _more(Icons.graphic_eq, 'Room EQ & loudness', 'Measure your room, 15-band EQ',
+              () => _open('Room EQ & loudness',
+                  () => [_dspCard(((a.spot.extras['dsp'] ?? const {}) as Map))])),
+          _more(Icons.history, 'Listening history', 'What played, and for how long',
+              () => _open('History', () => [_historyCard()])),
+          _more(Icons.monitor_heart_outlined, 'Freeze history',
+              'Every receiver freeze, with what led up to it',
+              () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => FreezeHistoryPage(app: a)))),
         ],
       ),
     );
