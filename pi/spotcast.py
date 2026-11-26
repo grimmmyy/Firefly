@@ -145,7 +145,11 @@ def start_pipeline():
 
     ls = subprocess.Popen(
         ["parec", "-d", "spotcast_sink.monitor", "--format=s16le", "--rate=44100",
-         "--channels=2", "--raw", f"--latency-msec={CHUNK_MS}"],
+         "--channels=2", "--raw", f"--latency-msec={CHUNK_MS}",
+         # stay on spotcast_sink.monitor: with a DSP stage as the default sink,
+         # WirePlumber otherwise re-links the capture to that stage's monitor
+         # (and extras.pin_capture moved it back every 5 s)
+         "--property=node.dont-move=true", "--property=node.dont-reconnect=true"],
         stdout=subprocess.PIPE, bufsize=0)
 
     buf = bytearray()
