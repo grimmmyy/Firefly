@@ -89,7 +89,9 @@ def summarize_pcap(path, t_freeze):
     last_rx_reply = None
     for line in txt.splitlines():
         out["packets"] += 1
-        m = re.match(r"(\d+\.\d+)\s+\S+\s+\S+\s+(.*)", line)
+        # "-i any" captures carry "iface direction" before the payload; "-i eth0"
+        # captures don't
+        m = re.match(r"(\d+\.\d+)\s+(?:\S+\s+(?:In|Out|M|B|P)\s+)?(.*)", line)
         if not m:
             continue
         ts, rest = float(m.group(1)), m.group(2)
