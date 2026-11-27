@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/spotcast.dart';
 import '../theme.dart';
 import 'now_playing_sheet.dart';
+import 'setup_screen.dart';
 import 'shell.dart';
 import 'widgets.dart';
 
@@ -25,6 +26,10 @@ class HomeScreen extends StatelessWidget {
             ),
             if (s.connecting)
               const StatusPill('Connecting', color: Colors.white54)
+            else if (s.online && s.reconnecting)
+              const StatusPill('Reconnecting…', color: Colors.orangeAccent)
+            else if (s.online && s.remote)
+              const StatusPill('Away · via Tailscale', color: FireflyTheme.amber)
             else if (!s.online)
               const StatusPill('Bridge offline', color: Colors.redAccent)
             else if (s.receiver['reachable'] == false)
@@ -69,7 +74,13 @@ class _OfflineCard extends StatelessWidget {
             style: TextStyle(color: Colors.white.withValues(alpha: 0.65)),
           ),
           const SizedBox(height: 12),
-          FilledButton.tonal(onPressed: app.spot.start, child: const Text('Try again')),
+          Wrap(spacing: 8, children: [
+            FilledButton.tonal(onPressed: app.spot.start, child: const Text('Try again')),
+            OutlinedButton(
+              onPressed: () => openSetup(context, app),
+              child: const Text('Run setup check'),
+            ),
+          ]),
         ]),
       );
 }
@@ -260,9 +271,28 @@ class _HealthStrip extends StatelessWidget {
       'download-failed' => 'Update check failed ${fmtAgo(upd['checked'])}',
       _ => 'Auto-updates daily',
     };
+    final frozen = s.health['receiver_ok'] == false;
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Wrap(spacing: 8, runSpacing: 8, children: [
+        if (frozen)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.redAccent.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.redAccent),
+            ),
+            child: const Row(children: [
+              Icon(Icons.power_off, color: Colors.redAccent),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text("The receiver's network control is frozen. Unplug it from the "
+                    'wall for 30 seconds, then plug it back in.'),
+              ),
+            ]),
+          ),
         StatusPill(buf == null ? 'Delay –' : 'Delay ${((buf as num) * 1000).round() + ((q ?? 0) as num).round()} ms',
             color: Colors.lightBlueAccent),
         StatusPill(stalls == 0 ? 'No dropouts' : '$stalls dropouts',

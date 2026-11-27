@@ -1,0 +1,8 @@
+[Unit]
+Description=Snapshot the living-room bridge settings
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /opt/spotcast/spotcast-backup.sh
+Nice=15
+IOSchedulingClass=idle

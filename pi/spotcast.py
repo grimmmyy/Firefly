@@ -10,7 +10,7 @@ librespot --onevent posts player events to /event; on "playing" we make sure
 the receiver is powered on and playing our stream.
 """
 import os, sys, re, time, struct, threading, subprocess, socket, html, logging
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, http.client
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 RECEIVER = os.environ.get("SPOTCAST_RECEIVER", "192.168.1.7")
@@ -73,6 +73,13 @@ class Hub:
     def count(self):
         with self.lock:
             return len(self.clients)
+
+
+# Pre-roll: a new receiver connection first gets the last PREROLL_MS of audio,
+# so its buffer starts full instead of stuttering through the first second.
+# buffer_tuner trims the extra latency back off during the next silence.
+PREROLL_MS = int(os.environ.get("SPOTCAST_PREROLL_MS", "400"))
+_preroll = []          # recent wav chunks (bytes), newest last
 
 
 # Receiver buffer tuning. The RX-V671 settles at a random 0.25-0.8 s buffer per
@@ -138,7 +145,11 @@ def start_pipeline():
 
     ls = subprocess.Popen(
         ["parec", "-d", "spotcast_sink.monitor", "--format=s16le", "--rate=44100",
-         "--channels=2", "--raw", f"--latency-msec={CHUNK_MS}"],
+         "--channels=2", "--raw", f"--latency-msec={CHUNK_MS}",
+         # stay on spotcast_sink.monitor: with a DSP stage as the default sink,
+         # WirePlumber otherwise re-links the capture to that stage's monitor
+         # (and extras.pin_capture moved it back every 5 s)
+         "--property=node.dont-move=true", "--property=node.dont-reconnect=true"],
         stdout=subprocess.PIPE, bufsize=0)
 
     buf = bytearray()
@@ -179,6 +190,10 @@ def start_pipeline():
                     tune["drained"] += step
                 else:
                     wav_hub.publish(out)
+            if PREROLL_MS > 0:
+                _preroll.append(out)
+                if len(_preroll) > PREROLL_MS // CHUNK_MS:
+                    del _preroll[0]
             if hub.count():
                 try:
                     ff.stdin.write(out)
@@ -208,8 +223,19 @@ def start_pipeline():
 import json, shutil
 
 SPARE_NAME = os.environ.get("SPOTCAST_SPARE_NAME", "Living Room - Add me")
+# MODE "shared" (default since 2026-11-18): one LAN-visible "Living Room
+# (RX-V671)" that anyone on the network can pick; picking it hands it to that
+# account (Spotify Connect hand-off, ~0.5 s). Plus one hidden slot for the
+# account Alexa plays under, so "Alexa, play X" can still be followed.
+# Other linked slots are kept on disk but not started. MODE "accounts" is the
+# previous one-slot-per-account + "Add me" behaviour.
+MODE = os.environ.get("SPOTCAST_MODE", "shared")
+ALEXA_ACCOUNT = os.environ.get("SPOTCAST_ALEXA_ACCOUNT", "")
+ALEXA_NAME = os.environ.get("SPOTCAST_ALEXA_NAME", "Living Room (Alexa)")
+SHARED_N = 50          # shared slot: dir slots/shared, ws port 9150
 MAX_SLOTS = int(os.environ.get("SPOTCAST_MAX_SLOTS", "6"))
 SLOT_ROOT = "/var/lib/spotcast-user/slots"
+HIDDEN_PROCS = "/sys/fs/cgroup/system.slice/spotcast.service/hidden/cgroup.procs"
 
 
 # ---------------- show "Add me" only when an unregistered device needs it -----------
@@ -333,8 +359,22 @@ class Slot:
         self.dir = f"{SLOT_ROOT}/{n}"
         self.port = 9100 + n
         self.proc = None
-        self.playing = False
+        self.shared = n == SHARED_N
+        if self.shared:
+            self.dir = f"{SLOT_ROOT}/shared"
+        self._playing = False      # from Soloist: playing AND the active device
+        self.sounding = False      # from the mixer: its audio is reaching the receiver
         os.makedirs(self.dir, exist_ok=True)
+
+    # Soloist's active-device flag can stay false while a slot plays (Alexa
+    # follow hand-off), so the audio counts too. Writes set the Soloist side.
+    @property
+    def playing(self):
+        return self._playing or self.sounding
+
+    @playing.setter
+    def playing(self, v):
+        self._playing = bool(v)
 
     @property
     def paired(self):
@@ -358,7 +398,13 @@ class Slot:
             return ""
 
     def name(self):
-        return NAME if self.paired else SPARE_NAME
+        if self.shared:
+            return NAME
+        if not self.paired:
+            return SPARE_NAME
+        if MODE == "shared" and ALEXA_ACCOUNT and self.account() == ALEXA_ACCOUNT:
+            return ALEXA_NAME
+        return NAME
 
     def profile(self, refresh=False):
         """{'username', 'display_name', 'image'} for this slot's account.
@@ -410,15 +456,23 @@ class Slot:
     def run(self):
         while True:
             log.info("slot %d starting as '%s'", self.n, self.name())
-            self.proc = subprocess.Popen(
-                ["soloist", "--device-name", self.name(),
+            cmd = ["soloist", "--device-name", self.name(),
                  "--api-key", os.environ["SOLOIST_API_KEY"], "--data-dir", self.dir,
                  "--ws", f"127.0.0.1:{self.port}", "--initial-volume", "100",
-                 "--cache-size", os.environ.get("SPOTCAST_CACHE_MB", "300")],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                   "--cache-size", os.environ.get("SPOTCAST_CACHE_MB", "300")]
+            if self.paired and not self.shared:
+                # Linked account: join the "hidden" cgroup *before* exec, so the
+                # mDNS socket Soloist opens is covered by spotcast-hide.sh's
+                # firewall rule. Fails open (visible) if the cgroup is missing.
+                if not os.access(HIDDEN_PROCS, os.W_OK):
+                    log.info("slot %d: %s not writable; it will be visible on the LAN",
+                             self.n, HIDDEN_PROCS)
+                cmd = ["sh", "-c", 'echo $$ > "$0" 2>/dev/null; exec "$@"', HIDDEN_PROCS] + cmd
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True)
             threading.Thread(target=self.read_output, args=(self.proc,), daemon=True).start()
             threading.Thread(target=self.watch, args=(self.proc,), daemon=True).start()
-            if not self.paired:
+            if not self.paired and not self.shared:
                 threading.Thread(target=devices.set_spare, args=(self.proc.pid,),
                                  daemon=True).start()
             rc = self.proc.wait()
@@ -460,7 +514,10 @@ class Slot:
                 except Exception:
                     continue
                 t = ev.get("type")
-                if t == "auth_state" and ev.get("logged_in") and not self.paired:
+                if t == "auth_state" and ev.get("logged_in") and self.shared:
+                    log.info("shared slot: now %s", (self.account() or "?")[:6] + "...")
+                    event("shared-handoff")
+                elif t == "auth_state" and ev.get("logged_in") and not self.paired:
                     time.sleep(2)                       # let Soloist write its user dir
                     open(f"{self.dir}/paired", "w").close()
                     acct = self.account()
@@ -484,9 +541,9 @@ class Slot:
                         follow.remote_play(self, uri)
                     # Every device on an account sees that account's playback;
                     # only count it when THIS device is the active output.
-                    was = self.playing
+                    was = self._playing
                     self.playing = (ev.get("status") == "playing") and self.is_active()
-                    if self.playing and not was:
+                    if self._playing and not was:
                         self.mgr.took_over(self)
                     if not self.playing and getattr(self, "pending_rename", False):
                         self.pending_rename = False
@@ -508,12 +565,16 @@ class SlotManager:
         self.add_until = 0.0
 
     def open_add_window(self, quiet=False):
+        if MODE == "shared":
+            return                       # no "Add me" in shared mode
         self.add_until = time.time() + ADD_WINDOW
         if not quiet:
             log.info("add window open for %ds", ADD_WINDOW)
         self.ensure_spare()
 
     def add_window_left(self):
+        if MODE == "shared":
+            return 0
         if PERMANENT_SPARE:
             return 10 ** 9
         return max(0, int(self.add_until - time.time()))
@@ -526,7 +587,7 @@ class SlotManager:
             if self.add_window_left() > 0:
                 continue
             with self.lock:
-                for sl in [x for x in self.slots if not x.paired]:
+                for sl in [x for x in self.slots if not x.paired and not x.shared]:
                     log.info("add window closed; removing spare slot %d", sl.n)
                     sl.retired = True
                     if sl.proc:
@@ -542,9 +603,25 @@ class SlotManager:
         ns = sorted(int(d) for d in os.listdir(SLOT_ROOT) if d.isdigit())
         for n in ns:
             if os.path.exists(f"{SLOT_ROOT}/{n}/paired"):
+                if MODE == "shared" and ALEXA_ACCOUNT:
+                    try:
+                        acct = open(f"{SLOT_ROOT}/{n}/paired").read().strip()
+                    except OSError:
+                        acct = ""
+                    if acct != ALEXA_ACCOUNT:
+                        log.info("shared mode: slot %d kept on disk, not started", n)
+                        continue
                 self._spawn(n)
             else:
                 shutil.rmtree(f"{SLOT_ROOT}/{n}", ignore_errors=True)
+        if MODE == "shared":
+            os.makedirs(f"{SLOT_ROOT}/shared", exist_ok=True)
+            self._spawn(SHARED_N)
+            log.info("shared mode: '%s' open to everyone; Alexa slot: %s", NAME,
+                     "yes" if any(x.paired for x in self.slots) else "none")
+            threading.Thread(target=lambda: [x.profile() for x in list(self.slots) if x.paired],
+                             daemon=True).start()
+            return
         seen = {}
         for sl in sorted(self.slots, key=lambda x: os.path.getmtime(f"{x.dir}/paired"),
                          reverse=True):
@@ -570,6 +647,8 @@ class SlotManager:
         return sl
 
     def ensure_spare(self):
+        if MODE == "shared":
+            return
         with self.lock:
             if self.add_window_left() <= 0:
                 return
@@ -601,10 +680,12 @@ class SlotManager:
                              acct[:6] + "...", sl.n)
                     self.retire(sl)
 
+    current = None   # the one slot whose audio may reach the receiver
+
     def took_over(self, slot):
         log.info("slot %d started playing; pausing others", slot.n)
-        if health.get("bt_streaming"):
-            threading.Thread(target=bt_pause, daemon=True).start()
+        self.current = slot
+        threading.Thread(target=enforce_single_output, daemon=True).start()
         for s in self.slots:
             # Only pause a slot that is still the active output for its account;
             # pausing an inactive slot would pause that account on other devices.
@@ -622,40 +703,158 @@ slots = SlotManager()
 # requests. Every call to it goes through this gate: one at a time, with a
 # minimum gap between requests.
 RX_GATE = threading.Lock()
-RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.12"))
+RX_MIN_GAP = float(os.environ.get("SPOTCAST_RX_GAP", "0.25"))
 _rx_last = [0.0]
+# After a "heavy" command (power, input switch, receiver scene) the receiver
+# reconfigures its audio path; the next request waits this long. Unlike the
+# sound-change quiet window this only delays, so multi-step sequences
+# (power on -> input -> SetAVTransportURI -> Play) still complete.
+RX_SETTLE_S = float(os.environ.get("SPOTCAST_RX_SETTLE_S", "3"))
+_HEAVY = (b"<Input_Sel>", b"<Power>On", b"<Power>Standby", b"<Scene_Load>")
+_rx_settle = [0.0]
 
 
-rx_stats = {"ok": 0, "fail": 0, "first_fail": None, "last_ok": None, "log": []}
+rx_stats = {"ok": 0, "fail": 0, "first_fail": None, "last_ok": None, "log": [],
+            "streak": 0, "retry_at": 0.0}
+
+# After consecutive failures, don't touch the receiver again until the back-off
+# step has passed (2 s, 5 s, 15 s, then 60 s); a frozen network module gets
+# quiet time to recover instead of a queue of retries.
+RX_BACKOFF = (2, 5, 15, 60)
 
 
-def rx_request(req, timeout=5):
+class ReceiverBackoff(OSError):
+    pass
+
+
+# One kept-open HTTP/1.1 connection per receiver port (YNC :80, UPnP :49154).
+# All use is serialised by RX_GATE, so no locking of its own.
+_rx_conns = {}
+
+
+# The RX-V671's 2011 web server wedged (needing a wall unplug) after the switch
+# to kept-open connections + GENA on 2026-11-18. Default back to one request
+# per connection; SPOTCAST_RX_KEEPALIVE=1 restores kept-open.
+RX_KEEPALIVE = os.environ.get("SPOTCAST_RX_KEEPALIVE", "0") == "1"
+
+
+def _rx_send(port, path, data, headers, timeout, method="POST"):
+    if not RX_KEEPALIVE:
+        headers = {**headers, "Connection": "close"}
+        conn = http.client.HTTPConnection(RECEIVER, port, timeout=timeout)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            r = conn.getresponse()
+            body = r.read().decode("utf-8", "replace")
+            if r.status >= 400:
+                raise urllib.error.HTTPError(f"http://{RECEIVER}:{port}{path}", r.status,
+                                             r.reason, r.headers, None)
+            return body, r.headers
+        finally:
+            conn.close()
+    for attempt in (1, 2):
+        conn = _rx_conns.get(port)
+        fresh = conn is None
+        if fresh:
+            conn = _rx_conns[port] = http.client.HTTPConnection(RECEIVER, port, timeout=timeout)
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            r = conn.getresponse()
+            body = r.read().decode("utf-8", "replace")
+            if r.will_close:
+                conn.close(); _rx_conns.pop(port, None)
+            if r.status >= 400:
+                raise urllib.error.HTTPError(f"http://{RECEIVER}:{port}{path}", r.status,
+                                             r.reason, r.headers, None)
+            return body, r.headers
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError,
+                http.client.CannotSendRequest, http.client.BadStatusLine):
+            # the receiver closed an idle kept-open socket: reconnect once
+            conn.close(); _rx_conns.pop(port, None)
+            if fresh or attempt == 2:
+                raise
+        except Exception:
+            conn.close(); _rx_conns.pop(port, None)
+            raise
+
+
+# Receiver response time, bucketed per hour (last 48 h): a slowly rising
+# median is the early warning before its network control freezes.
+rx_latency = {}          # hour start (epoch) -> [count, sum_ms, max_ms, slow(>1 s)]
+
+
+def rx_latency_add(sec):
+    h = int(time.time() // 3600 * 3600)
+    b = rx_latency.setdefault(h, [0, 0.0, 0.0, 0])
+    ms = sec * 1000
+    b[0] += 1; b[1] += ms; b[2] = max(b[2], ms); b[3] += ms > 1000
+    for k in [k for k in rx_latency if k < h - 48 * 3600]:
+        del rx_latency[k]
+
+
+def rx_latency_report():
+    return [{"hour": h, "n": b[0], "avg_ms": round(b[1] / b[0]), "max_ms": round(b[2]),
+             "slow": b[3]} for h, b in sorted(rx_latency.items()) if b[0]]
+
+
+def rx_request(req, timeout=5, with_headers=False):
     with RX_GATE:
-        wait = RX_MIN_GAP - (time.monotonic() - _rx_last[0])
+        if time.time() < rx_stats["retry_at"]:
+            raise ReceiverBackoff(f"receiver backing off {rx_stats['retry_at'] - time.time():.0f}s")
+        if time.time() < rx_stats.get("quiet_until", 0):
+            # The RX-V671 rebuilds its DSP after a sound change; requests that
+            # arrive meanwhile have frozen its network control (reproduced
+            # 2026-11-24). Nothing is sent until it has settled.
+            raise ReceiverBackoff(f"receiver applying a sound change, "
+                                  f"{rx_stats['quiet_until'] - time.time():.0f}s")
+        wait = max(RX_MIN_GAP - (time.monotonic() - _rx_last[0]),
+                   _rx_settle[0] - time.monotonic())
         if wait > 0:
             time.sleep(wait)
         what = (req.full_url.rsplit("/", 2)[-2] + ":" +
                 (req.headers.get("Soapaction") or req.headers.get("SOAPACTION") or
                  (req.data or b"")[:60].decode("utf-8", "replace"))).replace(chr(10), " ")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                body = r.read().decode("utf-8", "replace")
+            u = urllib.parse.urlsplit(req.full_url)
+            t0 = time.monotonic()
+            body, hdrs = _rx_send(u.port or 80, u.path, req.data, dict(req.header_items()),
+                                  timeout, req.get_method())
+            rx_latency_add(time.monotonic() - t0)
+            if req.data and any(h in req.data for h in _HEAVY):
+                _rx_settle[0] = time.monotonic() + RX_SETTLE_S
+                if freezelog:
+                    freezelog.mark("heavy_cmd", what)
+            rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
             if rx_stats["first_fail"]:
                 log.info("receiver control recovered after %ds down",
                          time.time() - rx_stats["first_fail"])
                 event("rx-recovered", down_s=int(time.time() - rx_stats["first_fail"]))
+                if freezelog:
+                    freezelog.mark_recovered(time.time() - rx_stats["first_fail"])
                 rx_stats["first_fail"] = None
+                rx_stats["last_recovered"] = time.time()
             rx_stats["ok"] += 1
             rx_stats["last_ok"] = time.time()
             rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "ok", what[:70])])[-40:]
-            return body
+            return (body, hdrs) if with_headers else body
         except Exception as e:
             rx_stats["fail"] += 1
+            if isinstance(e, urllib.error.HTTPError):
+                raise                        # it answered: alive, no back-off
+            rx_stats["streak"] += 1
+            step = RX_BACKOFF[min(rx_stats["streak"], len(RX_BACKOFF)) - 1]
+            rx_stats["retry_at"] = time.time() + step
+            log.info("receiver request failed (%s); backing off %ds", e, step)
             rx_stats["log"] = (rx_stats["log"] + [(round(time.time(), 1), "FAIL", what[:70])])[-40:]
             if not rx_stats["first_fail"]:
                 rx_stats["first_fail"] = time.time()
                 # keep the requests that led up to the freeze for diagnosis
                 event("rx-down", error=str(e)[:120], last_requests=rx_stats["log"][-15:])
+                if freezelog:
+                    freezelog.report(str(e))
                 log.info("receiver control FAILED (%s); last requests logged", e)
             raise
         finally:
@@ -771,9 +970,15 @@ def health_monitor():
         if pw is None:
             if health["receiver_fail_since"] is None:
                 health["receiver_fail_since"] = time.time()
-            elif time.time() - health["receiver_fail_since"] > 300 and health["receiver_ok"]:
+            # two failed checks in a row (about a minute); a sound-change quiet
+            # window lasts 30 s, so it never trips this
+            elif time.time() - health["receiver_fail_since"] > 50 and health["receiver_ok"]:
                 health["receiver_ok"] = False
-                alert("receiver-down", "Receiver (RX-V671) unreachable for 5 minutes - "
+                frozen = sh_out(["ping", "-c1", "-W1", RECEIVER]).find(" 0% packet loss") >= 0
+                alert("receiver-down",
+                      "Receiver (RX-V671) answers ping but its network control is frozen - "
+                      "unplug it from the wall for 30 s" if frozen else
+                      "Receiver (RX-V671) unreachable for a minute - "
                       "check its power and network cable")
         else:
             if not health["receiver_ok"]:
@@ -808,13 +1013,68 @@ def health_monitor():
             pass
 
 
+_mix_lock = threading.Lock()
+_uncorked = set()   # Spotify sink inputs that were producing audio last pass
+
+
+def enforce_single_output():
+    """Only the slot that most recently took over may be heard. A slot whose
+    account disconnected is no longer 'active', so it isn't paused, but its
+    Soloist can keep rendering into the shared sink; mute every Spotify stream
+    that doesn't belong to the current slot (unmute it when it takes over).
+    Soloist's "active device" flag can lag or stay false while a slot plays
+    (seen with Alexa follow), so the audio decides too: the slot whose stream
+    most recently started producing sound becomes current."""
+    with _mix_lock:
+        pids = {}
+        for block in sh_out(["pactl", "list", "clients"]).split("Client #")[1:]:
+            m = re.search(r'application.process.id = "(\d+)"', block)
+            if m:
+                pids[block.split(chr(10), 1)[0].strip()] = int(m.group(1))
+        by_pid = {sl.proc.pid: sl for sl in list(slots.slots)
+                  if sl.proc and sl.proc.poll() is None}
+        streams = []
+        for block in sh_out(["pactl", "list", "sink-inputs"]).split("Sink Input #")[1:]:
+            if 'application.name = "Spotify"' not in block:
+                continue
+            idx = block.split(chr(10), 1)[0].strip()
+            m = re.search(r"Client: (\d+)", block)
+            sl = by_pid.get(pids.get(m.group(1) if m else ""))
+            streams.append((idx, sl, "Corked: no" in block, block))
+        now_uncorked = {idx for idx, _, live, _ in streams if live}
+        for idx, sl, live, _ in streams:
+            if live and idx not in _uncorked and sl is not None and sl is not slots.current:
+                log.info("mixer: slot %d started sounding; it is now the current slot", sl.n)
+                slots.current = sl
+        _uncorked.clear(); _uncorked.update(now_uncorked)
+        cur = slots.current
+        for sl in by_pid.values():
+            sl.sounding = sl is cur and any(x is sl and live for _, x, live, _ in streams)
+        if cur is None or cur.proc is None or cur.proc.poll() is not None:
+            return
+        for idx, sl, live, block in streams:
+            want = sl is not cur or (extras is not None and extras.mute_spotify())
+            muted = "Mute: yes" in block
+            if want != muted:
+                sh_out(["pactl", "set-sink-input-mute", idx, "1" if want else "0"])
+                log.info("mixer: %s stream %s (current slot %d)",
+                         "muted" if want else "unmuted", idx, cur.n)
+                if want:
+                    event("muted-other-slot", sink_input=idx, current=cur.n)
+
+
 def pin_stream_volumes():
     """Soloist ties its PipeWire stream volume to the Spotify volume slider, so a
     slider at 0 (e.g. after Alexa/phone changes) made the receiver silent. The
     receiver is the volume control: keep every Spotify stream at 100%."""
+    n = 0
     while True:
-        time.sleep(2)
+        time.sleep(1)
+        n += 1
         try:
+            enforce_single_output()
+            if n % 2:
+                continue                     # volume pin every 2 s as before
             out = sh_out(["pactl", "list", "sink-inputs"])
             for block in out.split("Sink Input #")[1:]:
                 idx = block.split(chr(10), 1)[0].strip()
@@ -897,8 +1157,26 @@ prev_receiver = {}
 _basic = {"t": 0.0, "xml": None}
 
 
+# While nothing plays, the receiver's status is re-read at most every
+# RX_IDLE_POLL_S (state changes made through the bridge invalidate it at once).
+# Test 2026-11-26: the receiver froze idle with only status polls (~3/min).
+RX_IDLE_POLL_S = float(os.environ.get("SPOTCAST_RX_IDLE_POLL_S", "300"))
+
+
+def bridge_idle():
+    try:
+        if any(x.playing for x in slots.slots) or wav_hub.count():
+            return False
+        return not (extras and extras.st.get("active"))
+    except Exception:
+        return False
+
+
 def basic_status(max_age=4.0):
-    """Main_Zone Basic_Status, shared by everything for max_age seconds."""
+    """Main_Zone Basic_Status, shared by everything for max_age seconds
+    (RX_IDLE_POLL_S while nothing is playing)."""
+    if _basic["xml"] is not None and bridge_idle():
+        max_age = max(max_age, RX_IDLE_POLL_S)
     if time.time() - _basic["t"] < max_age and _basic["xml"] is not None:
         return _basic["xml"]
     try:
@@ -988,104 +1266,18 @@ def sh_out(cmd, timeout=6):
         return ""
 
 
-def bt_devices():
-    """Paired Bluetooth devices: [{mac, name, connected, trusted}]."""
-    out = []
-    for line in sh_out(["bluetoothctl", "devices", "Paired"]).splitlines():
-        parts = line.split(" ", 2)
-        if len(parts) < 3:
-            continue
-        mac, name = parts[1], parts[2]
-        info = sh_out(["bluetoothctl", "info", mac])
-        out.append({"mac": mac, "name": name,
-                    "connected": "Connected: yes" in info,
-                    "trusted": "Trusted: yes" in info})
-    return out
-
-
-def bt_streaming():
-    """True if a Bluetooth phone/Echo is feeding audio into PipeWire right now."""
-    out = sh_out(["pactl", "list", "sink-inputs"])
-    for block in out.split("Sink Input #")[1:]:
-        if "bluez" in block and "Corked: no" in block:
-            return True
-    return False
-
-
-def bt_pause():
-    # AVRCP pause to whatever is streaming over Bluetooth (best effort)
-    for d in bt_devices():
-        if d["connected"]:
-            sh_out(["bluetoothctl", "player.pause"])
-            return
-
-
-def bt_watch():
-    """Trust newly paired devices; arbitrate Spotify vs Bluetooth (newest wins);
-    wake the receiver when any source starts making sound."""
-    was_bt = False
-    BT_STATE = "/var/lib/spotcast-user/bt_connected.json"
-    # after a reboot / restart: reconnect devices that were connected before
-    try:
-        wanted = json.load(open(BT_STATE))
-    except Exception:
-        wanted = []
-    # Echo devices (Amazon OUI / name) only accept connections they start
-    wanted = [m for m in wanted
-              if "Echo" not in sh_out(["bluetoothctl", "info", m]).split("Alias:")[-1][:40]]
-    if wanted:
-        def reconnect():
-            for attempt in range(3):
-                time.sleep(10)
-                missing = [m for m in wanted
-                           if "Connected: yes" not in sh_out(["bluetoothctl", "info", m])]
-                if not missing:
-                    log.info("bluetooth: reconnected %s", ", ".join(wanted))
-                    return
-                for m in missing:
-                    sh_out(["bluetoothctl", "connect", m], timeout=20)
-            # Echo devices refuse Pi-initiated A2DP; they reconnect when told
-            # "Alexa, connect to Living Room Speaker". Stop retrying quietly.
-            log.info("bluetooth: %s didn't accept a reconnect from the Pi "
-                     "(normal for Echo; ask Alexa to connect)", ", ".join(wanted))
-        threading.Thread(target=reconnect, daemon=True).start()
-    last_saved = None
+def sound_watch():
+    """Any source producing sound -> make sure the receiver plays our stream."""
     while True:
         time.sleep(1)
         try:
-            # remember which devices are connected (so a reboot restores them)
-            if int(time.time()) % 10 == 0:
-                conn = sorted(d["mac"] for d in bt_devices() if d["connected"])
-                if conn != last_saved and (conn or last_saved is not None):
-                    try:
-                        json.dump(conn, open(BT_STATE, "w"))
-                    except OSError:
-                        pass
-                    last_saved = conn
-            # trust paired devices so they can reconnect without pairing again
-            if int(time.time()) % 15 == 0:
-                for d in bt_devices():
-                    if not d["trusted"]:
-                        sh_out(["bluetoothctl", "trust", d["mac"]])
-                        log.info("bluetooth: trusted %s (%s)", d["name"], d["mac"])
-                        event("bt-paired", name=d["name"])
-            now_bt = bt_streaming()
-            if now_bt and not was_bt:
-                log.info("bluetooth audio started; pausing Spotify slots")
-                event("bt-start")
-                for x in slots.slots:
-                    if x.playing and x.is_active():
-                        x.ctl("pause"); x.playing = False
-            was_bt = now_bt
-            health["bt_streaming"] = now_bt
-            # any source producing sound -> make sure the receiver plays our stream
             if time.time() - activity["last_sound"] < 1.0:
                 health["last_playing"], health["handed_back"] = time.time(), False
                 if not stream_live():
                     threading.Thread(target=ensure_playing, daemon=True).start()
                     time.sleep(3)
         except Exception as e:
-            log.info("bt_watch error: %s", e)
+            log.info("sound_watch error: %s", e)
 
 
 _live_cache = {"t": 0.0, "v": False}
@@ -1097,74 +1289,6 @@ def stream_live():
     st, uri = transport_state()
     _live_cache.update(t=time.time(), v=(st == "PLAYING" and uri == STREAM_URL))
     return _live_cache["v"]
-
-
-A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
-
-
-def keep_echo_connected():
-    """Keep Bluetooth sources the user wants 'always on' (the Echo) connected.
-    Echo devices drop their pairing if hammered with refused connects, so:
-    only ever ask for their *Audio Source* profile (Pi = speaker), one try per
-    drop, with growing back-off, and never remove a pairing."""
-    state_file = "/var/lib/spotcast-user/bt_keep.json"
-    try:
-        keep = json.load(open(state_file))
-    except Exception:
-        keep = []
-    backoff = {m: 0 for m in keep}
-    next_try = {m: 0.0 for m in keep}
-    seen_connected = set()
-    while True:
-        time.sleep(20)
-        try:
-            for d in bt_devices():
-                mac = d["mac"]
-                if "Echo" in d["name"] and mac not in keep:
-                    keep.append(mac)                    # Echo paired: keep it on
-                    json.dump(keep, open(state_file, "w"))
-                    backoff[mac], next_try[mac] = 0, 0.0
-                if mac not in keep:
-                    continue
-                if d["connected"]:
-                    if mac not in seen_connected:
-                        log.info("bluetooth: %s connected", d["name"])
-                        event("bt-connected", name=d["name"])
-                    seen_connected.add(mac)
-                    backoff[mac], next_try[mac] = 0, 0.0
-                    health["echo_connected"] = True
-                    continue
-                health["echo_connected"] = False
-                if mac in seen_connected:
-                    seen_connected.discard(mac)
-                    log.info("bluetooth: %s disconnected; will retry gently", d["name"])
-                    event("bt-disconnected", name=d["name"])
-                    next_try[mac] = time.time() + 60          # give it a minute first
-                if time.time() < next_try.get(mac, 0):
-                    continue
-                if "Echo" in d["name"]:
-                    # Echo devices refuse every Pi-initiated connection (tested with
-                    # both profiles) and drop the pairing if pushed, so only watch
-                    # and remind; the Echo must connect ("Alexa, connect to ...").
-                    next_try[mac] = time.time() + 3600
-                    alert("echo-disconnected", f"{d['name']} isn't connected to the Living "
-                          "Room speaker - say 'Alexa, connect to Living Room Speaker'",
-                          every=12 * 3600)
-                    continue
-                out = sh_out(["bluetoothctl", "connect", mac, A2DP_SOURCE_UUID], timeout=25)
-                ok = "Connected: yes" in sh_out(["bluetoothctl", "info", mac])
-                log.info("bluetooth: reconnect %s -> %s", d["name"],
-                         "ok" if ok else (out.strip().splitlines() or ["refused"])[-1][:80])
-                if not ok:
-                    b = min(backoff.get(mac, 0) + 1, 3)
-                    backoff[mac] = b
-                    next_try[mac] = time.time() + {1: 900, 2: 1800, 3: 3600}[b]
-                    if b == 3:
-                        alert("echo-disconnected", f"{d['name']} is not connected to the "
-                              "Living Room speaker - say 'Alexa, connect to Living Room "
-                              "Speaker'", every=12 * 3600)
-        except Exception as e:
-            log.info("keep_echo_connected error: %s", e)
 
 
 class Follow:
@@ -1254,13 +1378,6 @@ class Follow:
 follow = Follow()
 
 
-def bt_pair_window(secs=120):
-    sh_out(["bluetoothctl", "pairable", "on"])
-    sh_out(["bluetoothctl", "discoverable", "on"])
-    log.info("bluetooth pairing open for %ds", secs)
-    event("bt-pair-open")
-
-
 def receiver_status():
     """(power, input) from the YNC API, or (None, None)."""
     try:
@@ -1280,7 +1397,7 @@ def position_seconds():
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) if m else None
 
 
-def measure_buffer(seconds=7):
+def measure_buffer(seconds=6):
     """Receiver buffer = audio sent since connect - receiver's played position,
     sampled exactly at each RelTime tick (RelTime has 1 s resolution)."""
     t0 = tune["t0"]
@@ -1295,7 +1412,7 @@ def measure_buffer(seconds=7):
         if rt is not None and last is not None and rt > last:
             ests.append((time.time() - t0 - tune["drained"]) - rt)
         last = rt
-        time.sleep(0.2)                  # gentle on the receiver (was 30 ms)
+        time.sleep(0.4)                  # ~15 requests per measurement (was 0.2 s / 35)
     ests = ests[1:] or ests
     # each tick is detected up to one poll interval late, which only ever
     # inflates the estimate, so the smallest sample is the most accurate
@@ -1323,7 +1440,7 @@ def buffer_tuner():
                          tune["drain_left"])
                 next_check = time.time() + 20
             else:
-                next_check = time.time() + 300
+                next_check = time.time() + 900          # every 15 min once settled
         except Exception as e:
             log.info("tuner error: %s", e)
             time.sleep(10)
@@ -1333,7 +1450,8 @@ def watchdog():
     """While Spotify is playing on any slot, keep the receiver on our stream.
     Leaves it alone if someone deliberately switched to another input."""
     while True:
-        time.sleep(8)
+        upnp["changed"].wait(15 if not upnp_subscribed() else 30)
+        upnp["changed"].clear()
         try:
             if not any(x.playing for x in slots.slots):
                 continue
@@ -1342,6 +1460,19 @@ def watchdog():
             if state == "PLAYING" and uri == STREAM_URL:
                 continue
             pw, inp = receiver_status()
+            by_hand = (pw == "Standby" or (pw == "On" and inp not in (None, "PC")))
+            if by_hand and time.time() - _last_takeover[0] > 20:
+                # someone used the remote/front panel: they want it off or on
+                # another source. Pause Spotify rather than take it back.
+                log.info("watchdog: receiver set to %s/%s by hand; pausing Spotify", pw, inp)
+                event("hand-override", power=pw, input=inp)
+                _hand_override[0] = time.time()
+                for x in list(slots.slots):
+                    if x.playing:
+                        x.ctl("pause")
+                        x.playing = False
+                follow.off("receiver changed by hand")
+                continue
             if pw == "On" and inp not in (None, "PC"):
                 continue                     # user picked another source
             log.info("watchdog: receiver %s/%s on %s; restoring stream", pw, inp, state)
@@ -1350,12 +1481,122 @@ def watchdog():
             log.info("watchdog error: %s", e)
 
 
+# ---------------- UPnP eventing (GENA) ----------------
+# The receiver pushes AVTransport changes to /upnp/event, so transport_state()
+# answers from this cache instead of two SOAP polls every few seconds. If the
+# subscription lapses, it falls back to polling.
+UPNP_SUB_S = int(os.environ.get("SPOTCAST_UPNP_SUB_S", "1800"))
+# Off by default: every daily soloist-update restart re-subscribed without
+# cancelling the old subscription, and the receiver froze within seconds
+# (Nov 19-23, every morning ~04:05). Polling worked for months before.
+UPNP_EVENTS = os.environ.get("SPOTCAST_UPNP_EVENTS", "0") == "1"
+UPNP_SID_FILE = "/var/lib/spotcast-user/upnp_sid"
+upnp = {"sid": None, "until": 0.0, "callback": None, "state": None, "uri": None,
+        "t": 0.0, "changed": threading.Event()}
+
+
+def upnp_subscribed():
+    return upnp["sid"] is not None and time.time() < upnp["until"]
+
+
+def upnp_notify(body):
+    x = html.unescape(body)                 # LastChange is XML escaped once
+    st = re.search(r'<TransportState val="([^"]*)"', x)
+    uri = re.search(r'<AVTransportURI val="([^"]*)"', x)
+    if st:
+        upnp["state"] = st.group(1)
+    if uri:
+        upnp["uri"] = html.unescape(uri.group(1))
+    if st or uri:
+        upnp["t"] = time.time()
+        _live_cache["t"] = 0.0
+        upnp["changed"].set()
+
+
+def _upnp_subscribe():
+    cb = f"<http://{lan_ip()}:{PORT}/upnp/event>"
+    renew = upnp["sid"] is not None and cb == upnp["callback"]
+    hdrs = ({"SID": upnp["sid"]} if renew else {"CALLBACK": cb, "NT": "upnp:event"})
+    hdrs["TIMEOUT"] = f"Second-{UPNP_SUB_S}"
+    req = urllib.request.Request(f"http://{RECEIVER}:{RECEIVER_UPNP}/AVTransport/event",
+                                 method="SUBSCRIBE", headers=hdrs)
+    _, h = rx_request(req, with_headers=True)
+    sid = h.get("SID") or upnp["sid"]
+    m = re.search(r"Second-(\d+)", h.get("TIMEOUT") or "")
+    secs = int(m.group(1)) if m else UPNP_SUB_S
+    if not renew:
+        log.info("upnp: subscribed to AVTransport events (%ds)", secs)
+        upnp["state"] = upnp["uri"] = None   # initial NOTIFY carries full state
+    upnp.update(sid=sid, callback=cb, until=time.time() + secs)
+    try:
+        with open(UPNP_SID_FILE, "w") as f:
+            f.write(sid or "")
+    except OSError:
+        pass
+    return secs
+
+
+def upnp_unsubscribe(sid=None, timeout=3):
+    """Cancel a subscription directly (bypasses back-off; used at exit/start)."""
+    sid = sid or upnp["sid"]
+    if not sid:
+        return
+    try:
+        c = http.client.HTTPConnection(RECEIVER, int(RECEIVER_UPNP), timeout=timeout)
+        c.request("UNSUBSCRIBE", "/AVTransport/event", headers={"SID": sid, "Connection": "close"})
+        c.getresponse().read()
+        c.close()
+        log.info("upnp: unsubscribed %s", sid[:12])
+    except Exception as e:
+        log.info("upnp: unsubscribe failed: %s", e)
+    upnp.update(sid=None, until=0.0)
+    try:
+        os.remove(UPNP_SID_FILE)
+    except OSError:
+        pass
+
+
+def upnp_events():
+    try:                                   # a previous process's subscription
+        stale = open(UPNP_SID_FILE).read().strip()
+    except OSError:
+        stale = ""
+    if stale:
+        upnp_unsubscribe(stale)
+    if not UPNP_EVENTS:
+        log.info("upnp: events off, polling the receiver")
+        return
+    while True:
+        try:
+            secs = _upnp_subscribe()
+            time.sleep(max(30, secs * 0.8))
+        except ReceiverBackoff:
+            time.sleep(max(1, rx_stats["retry_at"] - time.time()))
+        except Exception as e:
+            if upnp["sid"]:
+                log.info("upnp: subscription lost (%s); resubscribing", e)
+            upnp.update(sid=None, until=0.0)
+            time.sleep(RX_BACKOFF[min(rx_stats["streak"], len(RX_BACKOFF)) - 1]
+                       if rx_stats["streak"] else 5)
+
+
+_media_cache = {"state": None, "uri": "", "t": 0.0}
+
+
 def transport_state():
+    if upnp_subscribed() and upnp["state"] is not None and upnp["uri"] is not None:
+        return upnp["state"], upnp["uri"]
     try:
         r = soap("AVTransport", "GetTransportInfo", [("InstanceID", 0)])
         s = r.split("<CurrentTransportState>")[1].split("<")[0]
+        # the loaded URI only changes when something new is played; while the
+        # receiver keeps PLAYING, reuse it for a minute (halves the UPnP traffic)
+        c = _media_cache
+        if s == "PLAYING" and c["state"] == "PLAYING" and time.time() - c["t"] < 60:
+            return s, c["uri"]
         m = soap("AVTransport", "GetMediaInfo", [("InstanceID", 0)])
         uri = html.unescape(m.split("<CurrentURI>")[1].split("<")[0]) if "<CurrentURI>" in m else ""
+        c.update(state=s, uri=uri, t=time.time())
         return s, uri
     except Exception as e:
         log.info("transport query failed: %s", e)
@@ -1363,6 +1604,8 @@ def transport_state():
 
 
 ensure_lock = threading.Lock()
+_last_takeover = [0.0]   # when we last powered on / switched the receiver ourselves
+_hand_override = [0.0]   # when someone last turned it off / switched input by hand
 
 
 def refresh_stream_url():
@@ -1378,6 +1621,8 @@ def refresh_stream_url():
 
 
 def ensure_playing():
+    if time.time() - _hand_override[0] < 10:
+        return          # audio still draining after a hand override: don't grab it back
     refresh_stream_url()
     with ensure_lock:
         state, uri = transport_state()
@@ -1390,6 +1635,7 @@ def ensure_playing():
             if inp and inp != "PC":
                 remember_input(inp)
             log.info("taking over receiver (was power=%s input=%s)", pw, inp)
+        _last_takeover[0] = time.time()
         try:  # the RX-V671 renderer only accepts Play while on its "PC" (DLNA) input
             if pw != "On":
                 power_on()
@@ -1408,8 +1654,9 @@ def ensure_playing():
                 '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
                 f'<res protocolInfo="http-get:*:audio/mpeg:*">{STREAM_URL}</res>'
                 '</item></DIDL-Lite>')
-        for attempt in range(6):
+        for attempt in range(len(RX_BACKOFF) + 1):
             try:
+                _media_cache["t"] = 0.0                 # new URI: re-read it next time
                 soap("AVTransport", "SetAVTransportURI",
                      [("InstanceID", 0), ("CurrentURI", html.escape(STREAM_URL)),
                       ("CurrentURIMetaData", "")])
@@ -1418,7 +1665,8 @@ def ensure_playing():
                 return
             except Exception as e:
                 log.info("start attempt %d failed: %s", attempt + 1, e)
-                time.sleep(2)   # receiver may still be booting from standby
+                if attempt < len(RX_BACKOFF):  # receiver may still be booting
+                    time.sleep(max(RX_BACKOFF[attempt], rx_stats["retry_at"] - time.time()))
 
 
 def set_volume(spotify_vol):
@@ -1483,17 +1731,13 @@ def api_status():
     vol, mute = receiver_volume()
     sl = sleep_timer["until"]
     return {
-        "receiver": {"power": pw, "input": inp, "reachable": health["receiver_ok"],
+        "receiver": {"ip": RECEIVER, "power": pw, "input": inp,
+                     "reachable": health["receiver_ok"],
                      "volume_db": vol, "mute": mute, "max_db": MAX_DB},
         "queue": queue(),
         "follow": follow.status(),
-        "source": ("bluetooth" if health.get("bt_streaming") else
-                   "spotify" if any(x.playing for x in slots.slots) else
+        "source": ("spotify" if any(x.playing for x in slots.slots) else
                    "audio" if time.time() - activity["last_sound"] < 2 else None),
-        "bluetooth": {"devices": bt_devices(),
-                      "discoverable": "Discoverable: yes" in sh_out(["bluetoothctl", "show"]),
-                      "streaming": bool(health.get("bt_streaming")),
-                      "echo_connected": health.get("echo_connected")},
         "sleep_s": max(0, int(sl - time.time())) if sl else 0,
         "update": update_info(),
         "idle_handback_min": IDLE_HANDBACK_MIN,
@@ -1507,10 +1751,326 @@ def api_status():
                     "unknown": devices.unknown},
         "latency": {"receiver_buffer_s": tune["last"], "target_s": BUF["target"],
                     "pi_queue_ms": pi_buffer_ms()},
-        "health": {k: health[k] for k in ("stalls", "reconnects", "last_stall",
-                                          "soloist_days_left", "started")},
+        "health": {**{k: health[k] for k in ("stalls", "reconnects", "last_stall",
+                                             "soloist_days_left", "started")},
+                   "receiver_ok": health["receiver_ok"],
+                   "receiver_down_s": int(time.time() - health["receiver_fail_since"])
+                   if health["receiver_fail_since"] else 0},
         "stream_url": STREAM_URL,
+        "tailscale_ip": tailscale_ip(),
+        "alerts": {"ntfy": bool(NTFY_TOPIC), "discord": bool(DISCORD_WEBHOOK),
+                   "heartbeat": bool(HEARTBEAT_URL)},
+        "extras": extras.status() if extras else None,
+        "upnp_events": {"subscribed": upnp_subscribed(), "state": upnp["state"],
+                        "age_s": int(time.time() - upnp["t"]) if upnp["t"] else None},
     }
+
+
+# ---------------- setup & connectivity helpers ----------------
+import ipaddress, secrets, math
+
+RECEIVER_FILE = "/var/lib/spotcast-user/receiver_ip"
+PAIR_FILE = "/var/lib/spotcast-user/pair_token"
+HEARTBEAT_URL = os.environ.get("SPOTCAST_HEARTBEAT_URL", "")   # e.g. healthchecks.io ping URL
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")                    # Tailscale addresses
+
+
+def _ssdp_locations(timeout=4.0):
+    """M-SEARCH for MediaRenderers; returns {description URL}."""
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+           'MAN: "ssdp:discover"\r\nMX: 2\r\n'
+           "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n").encode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    found = set()
+    try:
+        for _ in range(2):
+            s.sendto(msg, ("239.255.255.250", 1900))
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                data, _ = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            m = re.search(rb"(?im)^location:\s*(\S+)", data)
+            if m:
+                found.add(m.group(1).decode("ascii", "replace"))
+    finally:
+        s.close()
+    return found
+
+
+def discover_receiver():
+    """Find a Yamaha RX-* receiver on the LAN. Returns its IP or None."""
+    try:
+        locs = _ssdp_locations()
+    except OSError as e:
+        log.info("receiver discovery failed: %s", e)
+        return None
+    for loc in sorted(locs):
+        try:
+            with urllib.request.urlopen(loc, timeout=3) as r:
+                desc = r.read(65536).decode("utf-8", "replace")
+        except Exception:
+            continue
+        model = re.search(r"<modelName>([^<]*)", desc)
+        maker = re.search(r"<manufacturer>([^<]*)", desc)
+        if (model and model.group(1).upper().startswith("RX-")) or \
+                (maker and "yamaha" in maker.group(1).lower()):
+            return urllib.parse.urlsplit(loc).hostname
+    return None
+
+
+def set_receiver(ip, why=""):
+    global RECEIVER
+    if not ip or ip == RECEIVER:
+        return
+    log.info("receiver address %s -> %s (%s)", RECEIVER, ip, why)
+    event("receiver-moved", old=RECEIVER, new=ip, why=why)
+    with RX_GATE:
+        for c in _rx_conns.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        _rx_conns.clear()
+        RECEIVER = ip
+        rx_stats["streak"], rx_stats["retry_at"] = 0, 0.0
+    upnp.update(sid=None, until=0.0, state=None, uri=None)
+    invalidate_basic()
+    try:
+        with open(RECEIVER_FILE, "w") as f:
+            f.write(ip)
+    except OSError:
+        pass
+
+
+def _ync_alive(ip, timeout=3):
+    try:
+        req = urllib.request.Request(
+            f"http://{ip}/YamahaRemoteControl/ctrl", method="POST",
+            data=b'<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>GetParam'
+                 b'</Basic_Status></Main_Zone></YAMAHA_AV>',
+            headers={"Content-Type": "text/xml"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return b"<Power>" in r.read()
+    except Exception:
+        return False
+
+
+def locate_receiver_at_start():
+    """Configured address first, then the last one we found, then SSDP."""
+    if _ync_alive(RECEIVER):
+        return
+    try:
+        saved = open(RECEIVER_FILE).read().strip()
+    except OSError:
+        saved = ""
+    if saved and saved != RECEIVER and _ync_alive(saved):
+        set_receiver(saved, "last known address")
+        return
+    ip = discover_receiver()
+    if ip:
+        set_receiver(ip, "found by SSDP at start")
+
+
+def receiver_finder():
+    """If the receiver stops answering for a minute, look for it at a new address
+    (DHCP lease change, router swap)."""
+    while True:
+        time.sleep(30)
+        ff = rx_stats["first_fail"]
+        if not ff or time.time() - ff < 60:
+            continue
+        ip = discover_receiver()
+        if ip and ip != RECEIVER:
+            set_receiver(ip, "unreachable at old address")
+            alert("receiver-moved", f"Receiver moved to {ip}; switched over automatically",
+                  every=0)
+            time.sleep(60)
+        else:
+            # a cable reset brings it back with a new DHCP lease within a minute;
+            # look again soon (one SSDP search, no traffic to the receiver itself)
+            time.sleep(15)
+
+
+def netwatch():
+    """Ethernet <-> Wi-Fi failover: when our LAN address changes mid-stream the
+    receiver's connection is dead, so point it at the new stream URL at once."""
+    while True:
+        time.sleep(5)
+        old = STREAM_URL
+        refresh_stream_url()
+        if STREAM_URL != old and old is not None:
+            event("net-failover", old=old, new=STREAM_URL)
+            alert("net-failover", f"Pi network changed; stream now at {STREAM_URL}", every=600)
+            if upnp["sid"]:
+                upnp_unsubscribe()              # resubscribe with the new callback address
+            if any(x.playing for x in slots.slots) or wav_hub.count():
+                threading.Thread(target=ensure_playing, daemon=True).start()
+
+
+def heartbeat():
+    """Dead-man ping: a service like healthchecks.io alerts when these stop,
+    which is the only way to hear about the Pi itself being offline."""
+    while HEARTBEAT_URL:
+        try:
+            urllib.request.urlopen(HEARTBEAT_URL, timeout=10).read()
+        except Exception as e:
+            log.info("heartbeat failed: %s", e)
+        time.sleep(60)
+
+
+def iface_addrs():
+    """{iface: ipv4} for every non-loopback interface."""
+    out = {}
+    for line in sh_out(["ip", "-4", "-o", "addr", "show"]).splitlines():
+        m = re.match(r"\d+:\s+(\S+)\s+inet\s+([\d.]+)", line)
+        if m and m.group(1) != "lo":
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def tailscale_ip():
+    for name, ip in iface_addrs().items():
+        if name.startswith("tailscale") or ipaddress.ip_address(ip) in _CGNAT:
+            return ip
+    return None
+
+
+def pair_token():
+    try:
+        t = open(PAIR_FILE).read().strip()
+        if t:
+            return t
+    except OSError:
+        pass
+    t = secrets.token_urlsafe(18)
+    old = os.umask(0o077)
+    try:
+        with open(PAIR_FILE, "w") as f:
+            f.write(t)
+    except OSError:
+        pass
+    finally:
+        os.umask(old)
+    return t
+
+
+def pair_uri():
+    q = {"h": lan_ip(), "t": pair_token()}
+    ts = tailscale_ip()
+    if ts:
+        q["ts"] = ts
+    return "firefly://pair?" + urllib.parse.urlencode(q)
+
+
+def qr_svg(text):
+    """QR code as inline SVG via the qrencode CLI (installed by install.sh)."""
+    try:
+        r = subprocess.run(["qrencode", "-t", "SVG", "-m", "2", "-s", "6", "-o", "-", text],
+                           capture_output=True, timeout=5)
+        svg = r.stdout.decode("utf-8", "replace")
+        i = svg.find("<svg")
+        return svg[i:] if i >= 0 else ""
+    except Exception:
+        return ""
+
+
+def is_remote(ip):
+    """True for clients outside the home LAN (Tailscale, anything public)."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return not (a.is_loopback or (a.is_private and a not in _CGNAT))
+
+
+def recent_problems(n=8):
+    kinds = {"alert", "stall", "rx-down", "net-failover", "receiver-moved", "hand-override"}
+    out = []
+    try:
+        with open(EVENT_LOG) as f:
+            lines = f.readlines()[-400:]
+    except OSError:
+        return out
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("kind") in kinds:
+            out.append(e)
+            if len(out) >= n:
+                break
+    return out
+
+
+def diagnose():
+    """Every known way this setup fails, checked live. Each: id, ok, detail, fix."""
+    res = []
+
+    def add(i, ok, detail, fix=""):
+        res.append({"id": i, "ok": bool(ok), "detail": detail, "fix": "" if ok else fix})
+    alive = _ync_alive(RECEIVER)
+    add("receiver", alive, f"Receiver at {RECEIVER}" + (" answers" if alive else " not answering"),
+        "Check the receiver has power and its network cable; Network Standby must be On")
+    if alive:
+        invalidate_basic()
+        pw, inp = receiver_status()
+        add("power", pw == "On", f"Power: {pw}",
+            "It's in standby; playing switches it on automatically")
+        add("input", inp == "PC", f"Input: {inp}",
+            "Not on PC; playing switches it, or pick 'Spotify / Firefly' as the input")
+        try:
+            urllib.request.urlopen(f"http://{RECEIVER}:{RECEIVER_UPNP}/MediaRenderer/desc.xml",
+                                   timeout=3).read(64)
+            add("upnp", True, "DLNA renderer reachable")
+        except Exception as e:
+            add("upnp", False, f"DLNA renderer not reachable ({e})",
+                "Power-cycle the receiver; check Network Standby is On")
+    if UPNP_EVENTS:
+        add("events", upnp_subscribed(), "Receiver pushes state changes" if upnp_subscribed()
+            else "Not subscribed to receiver events (polling instead)",
+            "Usually recovers by itself within a minute")
+    try:
+        with socket.create_connection((lan_ip(), PORT), timeout=2):
+            pass
+        add("stream", True, f"Stream served at {STREAM_URL}")
+    except OSError as e:
+        add("stream", False, f"Stream port not reachable ({e})", "Restart spotcast.service")
+    ifs = iface_addrs()
+    eth = next((v for k, v in ifs.items() if k.startswith(("eth", "en"))), None)
+    add("ethernet", eth is not None, f"Ethernet {eth}" if eth else "Ethernet not connected",
+        "Running on Wi-Fi; plug in the cable for steadier audio")
+    d = health["soloist_days_left"]
+    add("soloist", d is None or d > 10,
+        f"Spotify player build: {d} days left" if d is not None else "Spotify player build OK",
+        "Tap 'Check now' under auto-update")
+    paired = sum(1 for x in slots.slots if x.paired)
+    add("accounts", paired > 0, f"{paired} Spotify account(s) linked",
+        "In Spotify on home Wi-Fi, pick 'Living Room - Add me'")
+    ts = tailscale_ip()
+    add("remote", ts is not None, f"Remote access via Tailscale {ts}" if ts
+        else "No Tailscale (app works at home only)", "Optional: install Tailscale on the Pi")
+    return res
+
+
+def _tone_wav(seconds=2.0, hz=660.0):
+    n = int(44100 * seconds)
+    frames = bytearray()
+    for i in range(n):
+        env = min(1.0, i / 2000, (n - i) / 2000)        # click-free fade
+        v = int(9000 * env * math.sin(2 * math.pi * hz * i / 44100))
+        frames += struct.pack("<hh", v, v)
+    return (b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, 2, 44100, 44100 * 4, 4, 16) +
+            b"data" + struct.pack("<I", len(frames)) + bytes(frames))
+
+
+TONE = None
+extras = None
+freezelog = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1534,6 +2094,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if p.path == "/api/status":
                 out = api_status()
+            elif p.path == "/api/diagnose":
+                out = {"checks": diagnose()}
+            elif p.path == "/api/pair":
+                out = {"uri": pair_uri()}
+            elif p.path == "/api/rediscover":
+                ip = discover_receiver()
+                if ip:
+                    set_receiver(ip, "requested from app")
+                out = {"ok": bool(ip), "receiver": RECEIVER}
             elif p.path == "/api/add":
                 slots.open_add_window(); out = {"ok": True}
             elif p.path == "/api/ignore":
@@ -1558,10 +2127,6 @@ class Handler(BaseHTTPRequestHandler):
                 m = float(arg("min") or 0)
                 sleep_timer["until"] = time.time() + m * 60 if m > 0 else None
                 out = {"ok": True}
-            elif p.path == "/api/bt/pair":
-                bt_pair_window(); out = {"ok": True}
-            elif p.path == "/api/bt/forget":
-                sh_out(["bluetoothctl", "remove", arg("mac")]); out = {"ok": True}
             elif p.path == "/api/account/remove":
                 n = int(arg("slot"))
                 sl = next((x for x in slots.slots if x.n == n and x.paired), None)
@@ -1587,13 +2152,24 @@ class Handler(BaseHTTPRequestHandler):
             elif p.path == "/api/update":
                 subprocess.Popen(["sudo", "-n", "/usr/local/sbin/soloist-update"])
                 out = {"ok": True}
+            elif p.path.startswith("/api/x/") and extras:
+                body = None
+                if self.command == "POST":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(n) or b"null") if n else None
+                try:
+                    out = extras.api(p.path, arg, body)
+                except KeyError:
+                    code, out = 404, {"error": "not found"}
             elif p.path == "/api/control":
                 cmd = arg("cmd")
                 if cmd not in ("pause", "play", "next", "prev"):
                     raise ValueError("bad cmd")
                 for x in slots.slots:
-                    if x.is_active():
+                    if x.is_active() or (cmd == "pause" and x.playing) or                             (cmd == "play" and x is slots.current):
                         x.ctl(cmd)
+                        if cmd == "pause":
+                            x.playing = False
                 out = {"ok": True}
             else:
                 code, out = 404, {"error": "not found"}
@@ -1605,6 +2181,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_NOTIFY(self):
+        if urllib.parse.urlparse(self.path).path == "/upnp/event" and                 self.client_address[0] == RECEIVER:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            # the initial NOTIFY can beat the SUBSCRIBE response, so don't
+            # require the SID to be recorded yet; the source IP is checked above
+            upnp_notify(body)
+            self.send_response(200)
+        else:
+            self.send_response(412)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_HEAD(self):
         path = urllib.parse.urlparse(self.path).path
@@ -1623,8 +2212,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("contentFeatures.dlna.org", f"{pn};{feats}" if pn else feats)
         self.end_headers()
 
-    def do_GET(self):
+    def _remote_denied(self, p):
+        """Off the home LAN (e.g. over Tailscale) everything but the audio
+        needs the pairing token."""
+        if not is_remote(self.client_address[0]):
+            return False
+        qs = urllib.parse.parse_qs(p.query)
+        tok = self.headers.get("X-Firefly-Token") or (qs.get("t") or [""])[0]
+        if tok and secrets.compare_digest(tok, pair_token()):
+            return False
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"error":"pairing token required"}')
+        return True
+
+    def do_POST(self):
         p = urllib.parse.urlparse(self.path)
+        if self._remote_denied(p):
+            return
+        if p.path.startswith("/api/x/"):
+            self.api(p)
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_GET(self):
+        global TONE
+        p = urllib.parse.urlparse(self.path)
+        if p.path not in self.FORMATS and p.path != "/tone.wav" and self._remote_denied(p):
+            return
+        if p.path == "/tone.wav":
+            if TONE is None:
+                TONE = _tone_wav()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(TONE)))
+            self.end_headers()
+            self.wfile.write(TONE)
+            return
         if p.path in self.FORMATS:
             self._stream_headers(p.path)
             if p.path == "/stream.wav":
@@ -1641,6 +2266,8 @@ class Handler(BaseHTTPRequestHandler):
                 event("connect", ip=self.client_address[0])
             c = src.add()
             q, ev = c
+            if src is wav_hub and PREROLL_MS > 0:
+                q[:0] = list(_preroll)
             log.info("client connected %s (%d total)", self.client_address[0], hub.count())
             try:
                 while True:
@@ -1702,7 +2329,9 @@ code{{color:#ddd}}</style>
 <p>These make 'Add me' appear. Ignore TVs and speakers that aren't people.</p>
 <ul>{rows(devices.unknown, 'ignore', 'ignore')}</ul>
 <h3>Registered devices</h3><ul>{rows(devices.reg, 'forget', 'forget')}</ul>
-<h3>Ignored</h3><ul>{rows(devices.ignored, 'forget', 'un-ignore')}</ul>""".encode()
+<h3>Ignored</h3><ul>{rows(devices.ignored, 'forget', 'un-ignore')}</ul>
+{extras.html_section() if extras else ''}
+{health_html()}""".encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -1720,8 +2349,42 @@ code{{color:#ddd}}</style>
             self.send_response(404); self.end_headers()
 
 
+def health_html():
+    """Health + pairing section of the status page."""
+    checks = diagnose()
+    li = "".join(
+        f"<li class={'on' if c['ok'] else 'bad'}>{'&#10003;' if c['ok'] else '&#10007;'} "
+        f"{html.escape(c['detail'])}"
+        + (f"<br><small>{html.escape(c['fix'])}</small>" if c["fix"] else "") + "</li>"
+        for c in checks)
+    probs = "".join(
+        f"<li>{time.strftime('%b %d %H:%M', time.localtime(e['t']))} &middot; "
+        f"{html.escape(e.get('text') or e['kind'])}</li>" for e in recent_problems()) \
+        or "<li>none</li>"
+    acct = next((x.name() for x in slots.slots if x.playing), None)
+    uri = pair_uri()
+    qr = qr_svg(uri)
+    return f"""<style>.bad{{color:#ff6b6b}}small{{color:#888}}
+.qr{{background:#fff;padding:8px;border-radius:12px;width:220px}}.qr svg{{width:100%;height:auto}}</style>
+<h3>Health</h3><p>Receiver {html.escape(RECEIVER)} &middot; stream {html.escape(STREAM_URL or '')}
+&middot; playing: {html.escape(acct or 'nobody')}</p><ul>{li}</ul>
+<h3>Recent problems</h3><ul>{probs}</ul>
+<h3>Pair the Firefly app</h3>
+<p>In Firefly: Settings &rarr; Set up &rarr; Scan pairing code.</p>
+{f'<div class=qr>{qr}</div>' if qr else ''}
+<p><small>Or paste: <code>{html.escape(uri)}</code></small></p>"""
+
+
+def _on_term(signum, frame):
+    upnp_unsubscribe()
+    os._exit(0)
+
+
 def main():
     global STREAM_URL
+    import signal
+    signal.signal(signal.SIGTERM, _on_term)
+    locate_receiver_at_start()
     while True:
         try:
             STREAM_URL = f"http://{lan_ip()}:{PORT}/stream.{FORMAT}"
@@ -1731,6 +2394,7 @@ def main():
     log.info("spotcast '%s' -> %s, stream %s", NAME, RECEIVER, STREAM_URL)
     os.makedirs("/var/lib/spotcast", exist_ok=True)
     start_pipeline()
+    threading.Thread(target=upnp_events, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=buffer_tuner, daemon=True).start()
     threading.Thread(target=health_monitor, daemon=True).start()
@@ -1738,8 +2402,29 @@ def main():
     threading.Thread(target=stream_rest, daemon=True).start()
     threading.Thread(target=pin_stream_volumes, daemon=True).start()
     threading.Thread(target=sleep_watch, daemon=True).start()
-    threading.Thread(target=bt_watch, daemon=True).start()
-    threading.Thread(target=keep_echo_connected, daemon=True).start()
+    threading.Thread(target=sound_watch, daemon=True).start()
+    threading.Thread(target=receiver_finder, daemon=True).start()
+    threading.Thread(target=netwatch, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
+    global extras, freezelog
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import freezelog as _freezelog
+        freezelog = _freezelog
+    except Exception as e:
+        log.exception("freeze log unavailable: %s", e)
+    try:
+        import extras as _extras
+        extras = _extras
+        extras.start()
+    except Exception as e:
+        log.exception("extras failed to start: %s", e)
+        extras = None
+    try:
+        import rescue
+        rescue.start()
+    except Exception as e:
+        log.exception("freeze rescue unavailable: %s", e)
     try:
         up = float(open("/proc/uptime").read().split()[0])
         if up < 600:

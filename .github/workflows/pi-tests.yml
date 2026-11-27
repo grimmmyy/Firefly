@@ -1,0 +1,23 @@
+name: Pi bridge tests
+
+on:
+  push:
+    paths: ["pi/**", ".github/workflows/pi-tests.yml"]
+  pull_request:
+    paths: ["pi/**"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"     # Debian 13 on the Pi
+      - name: Compile every Pi script
+        run: python -m py_compile pi/*.py
+      - name: Shell scripts parse
+        run: for f in pi/*.sh; do sh -n "$f"; done
+      - name: Unit tests
+        run: python -m unittest discover -s pi/tests -v

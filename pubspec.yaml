@@ -21,6 +21,8 @@ dependencies:
   shared_preferences: ^2.2.2
   permission_handler: ^11.3.0
   audio_session: ^0.1.18
+  mobile_scanner: ^7.0.0
+  record: ^6.0.0
 
 dev_dependencies:
   flutter_launcher_icons: ^0.14.3

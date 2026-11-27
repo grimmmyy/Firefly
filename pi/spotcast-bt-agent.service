@@ -1,0 +1,15 @@
+[Unit]
+Description=spotcast Bluetooth pairing agent (no PIN, audio only)
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+ExecStartPre=/usr/bin/bluetoothctl system-alias "Living Room Speaker"
+ExecStartPre=/usr/bin/bluetoothctl pairable on
+ExecStartPost=/bin/sh -c "sleep 2; hciconfig hci0 class 0x240414 || true"
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

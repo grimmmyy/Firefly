@@ -61,10 +61,15 @@ class _RadioScreenState extends State<RadioScreen> {
 
   Future<void> _play(String name, String url, String mime) async {
     final a = widget.app;
-    if (a.cast.selected == null) {
+    if (a.cast.selected == null && !(a.spot.online && !a.spot.remote)) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('No receiver selected yet: check Settings → Receiver')));
       return;
+    }
+    // Through the bridge when it's reachable: the Pi plays the station, so it
+    // takes part in last-source-wins and the room EQ.
+    if (a.spot.online && !a.spot.remote) {
+      if (await a.spot.playRadioOnBridge(url, name)) return;
     }
     // Spotify and Firefly share the receiver: pause Spotify first.
     if (a.spot.online && a.spot.playing) await a.spot.control('pause');

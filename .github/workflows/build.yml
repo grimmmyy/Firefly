@@ -172,3 +172,66 @@ jobs:
           else
             gh release create "$V" out/* --title "Firefly ${V}" --notes-file "$NOTES" --latest
           fi
+
+  nightly:
+    name: Publish nightly + AltStore source
+    # Every successful branch push replaces the rolling "nightly" pre-release.
+    # AltStore reads altstore.json from it (Updates tab), and the Pi mirrors it
+    # to its download page (pi/firefly-dl-sync.sh).
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    needs: [android, ios, windows]
+    runs-on: ubuntu-latest
+    concurrency: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Collect assets and write the AltStore source
+        env:
+          REPO: ${{ github.repository }}
+          BUILD: ${{ github.run_number }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          V="${VERSION#v}"
+          mkdir -p out
+          cp dist/firefly-ios-unsigned-ipa/Firefly-unsigned.ipa out/Firefly-ios.ipa
+          cp dist/firefly-android-apk/app-release.apk           out/Firefly-android.apk
+          cp dist/firefly-windows/dist/Firefly-Setup.exe        out/Firefly-windows-setup.exe
+          BASE="https://github.com/${REPO}/releases/download/nightly"
+          SIZE=$(stat -c %s out/Firefly-ios.ipa)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          MSG=$(git log -1 --pretty=%s | head -c 300)
+          V="$V" BUILD="$BUILD" SIZE="$SIZE" DATE="$DATE" BASE="$BASE" REPO="$REPO" MSG="$MSG" BRANCH="$BRANCH" python3 - <<'PY'
+          import json, os
+          e = os.environ
+          ver = {"version": e["V"], "buildVersion": e["BUILD"], "date": e["DATE"],
+                 "localizedDescription": e["MSG"] + "\n(branch " + e["BRANCH"] + ")",
+                 "downloadURL": e["BASE"] + "/Firefly-ios.ipa", "size": int(e["SIZE"]),
+                 "minOSVersion": "15.0"}
+          app = {"name": "Firefly", "bundleIdentifier": "com.firefly.firefly",
+                 "developerName": "grimmmyy", "subtitle": "Cast to the living-room receiver",
+                 "localizedDescription": "Firefly controls the Yamaha RX-V671 and the Pi bridge.",
+                 "iconURL": f"https://raw.githubusercontent.com/{e['REPO']}/HEAD/assets/icon.png",
+                 "tintColor": "#F5B841", "versions": [ver],
+                 # AltStore 1.x reads these flat fields
+                 "version": ver["version"], "versionDate": ver["date"],
+                 "versionDescription": ver["localizedDescription"],
+                 "downloadURL": ver["downloadURL"], "size": ver["size"]}
+          src = {"name": "Firefly", "identifier": "com.firefly.source",
+                 "sourceURL": e["BASE"] + "/altstore.json",
+                 "iconURL": app["iconURL"], "apps": [app], "news": []}
+          json.dump(src, open("out/altstore.json", "w"), indent=2)
+          json.dump({"version": e["V"], "build": int(e["BUILD"]), "date": e["DATE"]},
+                    open("out/version.json", "w"))
+          PY
+          ls -la out
+      - name: Replace the nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --cleanup-tag -y 2>/dev/null || true
+          gh release create nightly out/* --target "${{ github.sha }}" --prerelease \
+            --title "Firefly nightly ${VERSION#v}" \
+            --notes "Latest successful build of ${{ github.ref_name }} (${{ github.sha }}). AltStore source: https://github.com/${{ github.repository }}/releases/download/nightly/altstore.json"

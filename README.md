@@ -77,6 +77,49 @@ flowchart LR
   multicast entitlements), bridge address, update status
 - Mini player and full-screen Now Playing on every screen
 
+### Modern-receiver features (Receiver tab)
+
+The Pi makes the 2011 RX-V671 behave like a current streaming receiver, with no extra hardware:
+
+- **AirPlay 2** (iPhone, iPad, Mac, Apple Music), built from source by `pi/build-airplay2.sh`.
+  The AirPlay volume slider moves the receiver's real volume.
+- **Cast (DLNA)**: appears as *Living Room (Pi cast)* in apps that cast to DLNA renderers.
+- **Bluetooth**: pairs as *Living Room Speaker*, no PIN; "Pair a phone" opens a 3-minute window.
+- **Internet radio played by the Pi**, so it works with everything below.
+- **Last source wins**: the newest source to start is heard; the others are muted and paused.
+- **Auto on / auto standby**: any source powers the receiver on and switches it to PC; after
+  20 minutes of silence it goes back to what it was doing (or standby).
+- **Sound**: sound program (DSP), Straight, Pure Direct, Compressed Music Enhancer, CINEMA DSP
+  3D, Dialogue Lift, night mode (Adaptive DRC), bass and treble, the receiver's own scenes 1-4.
+- **The receiver's own sources**: FM/AM tuner (presets, scan, direct tuning), USB stick and
+  media-server browsing with play controls, and renaming inputs (shown on the front display).
+- **Scenes**: one tap sets input, sound, volume and Zone 2. Each scene is also an Alexa device
+  (`alexa_local.py`) for voice and routines, along with *Night Mode* and *Zone 2*.
+- **Zone 2**: power, input and volume for a second room.
+- **Loudness levelling and room EQ**: LADSPA filters in PipeWire in front of the stream. *Measure
+  my room* plays a tone per band through the receiver and measures it with the phone's
+  microphone, then applies gentle corrections (Android, iOS).
+- **Schedules**: wake up to Spotify, an FM/AM preset or a radio stream with a slow volume fade
+  (1-60 min), fade-out sleep (ends in standby at the old volume), timed scenes, timed off. A fade
+  stops as soon as anyone moves the volume by hand.
+- **Automations**: sleep timer, quiet hours (a volume cap that also catches the remote), sound
+  per source (e.g. Straight + Enhancer for Spotify, Standard for HDMI1), and a receiver health
+  graph (response time per hour, the early sign of a network freeze).
+- **Android extras**: lower the volume during phone calls, a *Receiver* quick-settings tile and a
+  home-screen remote widget. All work with the app closed.
+- **Alexa** (`alexa_local.py`, local Hue emulation): Receiver, TV Mode, Music, Night Mode, Zone 2,
+  FM Radio, USB, Dialogue Lift, Sleep Timer ("set Sleep Timer to 50%" = 45 min), one device per
+  radio preset, and one per scene.
+- **History**: listening time per source per day, recent tracks and problems, also on the
+  status page.
+
+Pi API for all of the above: `/api/x/{status,sound,zone2,inputs,input_names,sources,bt,radio,`
+`dsp,roomeq/start,roomeq/apply,scenes,schedules,history,tuner,usb,server,sleep,fade,quiet,`
+`source_sound,health,quick,duck}`.
+
+The Pi also keeps a nightly settings snapshot (`/var/backups/spotcast`, 14 days, the Soloist key
+excluded); restore with `tar -xzpf <file> -C /`.
+
 ## Requirements
 
 | | |
@@ -95,16 +138,22 @@ flowchart LR
 
 ### 2. Raspberry Pi bridge
 1. Create a Soloist API key at <https://developer.spotify.com/dashboard/soloist> (Premium account).
-2. On the Pi:
+2. On the Pi, one command (it asks for the key; the receiver is found automatically):
    ```sh
-   git clone https://github.com/grimmmyy/Firefly.git
-   cd Firefly/pi
-   sudo SOLOIST_API_KEY=spak_xxx RECEIVER_IP=192.168.1.7 ./install.sh
+   curl -fsSL https://raw.githubusercontent.com/grimmmyy/Firefly/main/pi/get.sh | sudo sh
    ```
-   Optional: `SPEAKER_NAME="Kitchen (RX-V671)"`, `NTFY_TOPIC=my-private-topic`, `DISCORD_WEBHOOK=https://…`
+   Or from a clone: `cd Firefly/pi && sudo ./install.sh`.
+   Optional env: `RECEIVER_IP=…` (skip discovery), `SPEAKER_NAME="Kitchen (RX-V671)"`,
+   `NTFY_TOPIC=my-private-topic`, `DISCORD_WEBHOOK=https://…`,
+   `HEARTBEAT_URL=https://hc-ping.com/…` (alerts you when the Pi itself goes offline).
 3. In Spotify on the same Wi-Fi, pick **Living Room - Add me** once. From then on it appears as
    **Living Room (RX-V671)** on your account.
-4. Status page: `http://<pi-ip>:8090` · JSON: `http://<pi-ip>:8090/api/status`
+4. Status page: `http://<pi-ip>:8090`: health checks, recent problems and the app pairing QR code.
+   JSON: `/api/status`, `/api/diagnose`.
+
+The bridge finds the receiver again by itself if its address changes, and re-points the stream
+when the Pi switches between Ethernet and Wi-Fi. With Tailscale on the Pi and your phone, a paired
+app works away from home (off the LAN the API requires the pairing token).
 
 The API key is stored only in `/etc/spotcast/soloist.env` (mode 600) on the Pi.
 
@@ -113,12 +162,21 @@ Download from the [latest release](../../releases/latest):
 
 | Platform | File | Install |
 |---|---|---|
-| Windows | `Firefly-vX-windows-setup.exe` | Run the installer (Start menu shortcut and uninstaller included). A portable `�-windows-portable.zip` is also attached. |
+| Windows | `Firefly-vX-windows-setup.exe` | Run the installer (Start menu shortcut and uninstaller included). A portable `…-windows-portable.zip` is also attached. |
 | Android | `Firefly-vX-android.apk` | Open it and allow "install unknown apps" |
 | iOS | `Firefly-vX-ios.ipa` | Sideload with [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io) (free Apple ID: re-sign every 7 days) |
 
 Every release ships all three, and CI refuses to publish a release unless the EXE, IPA and APK all built.
+
+**Updates without hunting for files:** every successful build also replaces the rolling
+[`nightly`](../../releases/tag/nightly) pre-release, which carries an AltStore source. Add
+`https://github.com/grimmmyy/Firefly/releases/download/nightly/altstore.json` in AltStore
+(Sources → +) once, and new builds appear under **Updates**. The Pi mirrors each nightly to its
+download page (`http://<pi-ip>:8091`, `pi/firefly-dl-sync.sh`).
 Each release also includes the Raspberry Pi bridge (`spotcast-pi-bridge-vX.tar.gz`) and `SHA256SUMS.txt`.
+
+On first launch Firefly runs **Set up & check** (also in Settings): it finds the bridge and receiver,
+runs the bridge's health check, plays a test tone, and can scan the bridge's pairing code.
 
 On first launch, allow **Local Network** access (iOS) and the Windows Firewall prompt (**Private** networks),
 because the receiver pulls audio from the app.
@@ -143,6 +201,13 @@ were tested), and the RX-V671 rejects `audio/L16`.
 - `SetAVTransportURI` with DIDL-Lite metadata returns **500**; send empty metadata.
 - Accepts streaming WAV with an open-ended header; rejects L16.
 - YNC control: `POST http://<receiver>/YamahaRemoteControl/ctrl`.
+- **Network control freezes** (answers ping, HTTP hangs, needs a wall unplug). One cause is
+  proven: GENA subscriptions left behind by restarts (events are now off by default). The prime
+  suspect for the rest is **ARP flux** when the Pi is on the LAN twice (Ethernet + Wi-Fi) with
+  Linux's default ARP settings; the installer sets `arp_ignore=1` / `arp_announce=2`. Ruled out by
+  testing: SSDP floods (59,000 announcements) and connection churn (5,000 connections).
+- The media-server client is the **`PC`** input (YNC tag `PC`), the same input the bridge streams to.
+- FM tunes in 200 kHz steps from 87.5 MHz; `Tuner` frequency values are MHz × 100.
 
 ## Building from source
 
@@ -155,7 +220,8 @@ flutter build ios --release --no-codesign
 flutter build windows --release
 ```
 
-CI builds every push. Pushing a `v*` tag builds all platforms and publishes a GitHub Release with the
+CI builds every push, and `pi-tests.yml` runs the Pi bridge's offline tests
+(`python -m unittest discover -s pi/tests`) whenever `pi/` changes. Pushing a `v*` tag builds all platforms and publishes a GitHub Release with the
 Windows installer (`.exe`), iOS `.ipa`, Android `.apk`, a portable Windows zip, the Pi bridge tarball
 and checksums. If any platform fails, no release is published.
 

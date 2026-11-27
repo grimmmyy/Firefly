@@ -41,3 +41,4 @@ ios/Runner.xcodeproj/project.xcworkspace/xcuserdata/
 
 # macOS
 .DS_Store
+__pycache__/

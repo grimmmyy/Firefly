@@ -7,7 +7,9 @@ import 'home_screen.dart';
 import 'library_screen.dart';
 import 'now_playing_sheet.dart';
 import 'radio_screen.dart';
+import 'receiver_screen.dart';
 import 'settings_screen.dart';
+import 'setup_screen.dart';
 
 /// Bundles the two controllers so every screen gets both.
 class AppState {
@@ -37,7 +39,10 @@ class _ShellState extends State<Shell> {
     a.cast.loadRecents();
     a.cast.discover();
     a.spot.start();
+    WidgetsBinding.instance.addPostFrameCallback((_) => maybeFirstRunSetup(context, a));
   }
+
+  bool _seeded = false;
 
   @override
   void dispose() {
@@ -47,6 +52,13 @@ class _ShellState extends State<Shell> {
   }
 
   void _changed() {
+    // The bridge knows where the receiver is; use that if our own scan missed it.
+    final a = widget.app;
+    final rx = a.spot.receiverIp;
+    if (!_seeded && rx != null && !a.cast.discovering && a.cast.selected == null) {
+      _seeded = true;
+      a.cast.addReceiverByIp(rx);
+    }
     if (mounted) setState(() {});
   }
 
@@ -55,6 +67,7 @@ class _ShellState extends State<Shell> {
     final a = widget.app;
     final screens = [
       HomeScreen(app: a),
+      ReceiverScreen(app: a),
       RadioScreen(app: a),
       LibraryScreen(app: a),
       SettingsScreen(app: a),
@@ -76,6 +89,10 @@ class _ShellState extends State<Shell> {
                   icon: Icon(Icons.home_outlined),
                   selectedIcon: Icon(Icons.home),
                   label: 'Home'),
+              NavigationDestination(
+                  icon: Icon(Icons.speaker_outlined),
+                  selectedIcon: Icon(Icons.speaker),
+                  label: 'Receiver'),
               NavigationDestination(
                   icon: Icon(Icons.radio_outlined),
                   selectedIcon: Icon(Icons.radio),

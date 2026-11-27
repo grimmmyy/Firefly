@@ -121,7 +121,7 @@ class CastController extends ChangeNotifier {
     );
   }
 
-  Future<void> discover() async {
+  Future<void> discover({bool sweep = false}) async {
     discovering = true;
     notifyListeners();
     try {
@@ -131,7 +131,7 @@ class CastController extends ChangeNotifier {
         // Default seed for the home RX-V671.
         ...SsdpDiscovery.candidatesFor('192.168.1.7'),
       };
-      renderers = await _ssdp.discover();
+      renderers = await _ssdp.discover(sweep: sweep);
       // Remember every working description URL for next time.
       await prefs.setStringList('receiverUrls',
           {...renderers.map((r) => r.location.toString())}.toList());

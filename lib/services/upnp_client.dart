@@ -71,11 +71,28 @@ class UpnpClient {
           status.contains('<Power>On</Power>')) {
         return;
       }
-      await ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Power_Control><Power>On'
-          '</Power></Power_Control></Main_Zone></YAMAHA_AV>');
+      final wasOff = !status.contains('<Power>On</Power>');
+      if (wasOff) {
+        await ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Power_Control><Power>On'
+            '</Power></Power_Control></Main_Zone></YAMAHA_AV>');
+      }
       await ync('<YAMAHA_AV cmd="PUT"><Main_Zone><Input><Input_Sel>PC'
           '</Input_Sel></Input></Main_Zone></YAMAHA_AV>');
-      await Future.delayed(const Duration(seconds: 3));
+      // Wait until it reports On + PC instead of a fixed sleep: ~1 s when it
+      // was already on, up to 10 s for a cold boot from standby.
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (DateTime.now().isBefore(deadline)) {
+        await Future.delayed(const Duration(milliseconds: 700));
+        try {
+          final s = await ync('<YAMAHA_AV cmd="GET"><Main_Zone><Basic_Status>'
+              'GetParam</Basic_Status></Main_Zone></YAMAHA_AV>');
+          if (s.contains('<Input_Sel>PC</Input_Sel>') && s.contains('<Power>On</Power>')) {
+            // the renderer needs a moment after the input flips
+            await Future.delayed(Duration(milliseconds: wasOff ? 1500 : 500));
+            return;
+          }
+        } catch (_) {}
+      }
     } catch (_) {}
   }
 
