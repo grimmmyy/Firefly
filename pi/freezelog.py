@@ -156,24 +156,45 @@ def _pi_network_changes(minutes=15):
     return [l[:160] for l in out.splitlines() if "state change" in l or "dhcp4" in l][-15:]
 
 
-def likely_causes(r):
-    """Ranked guesses, each with the evidence behind it."""
+def _own_and_router_ips():
+    """This Pi's and the gateway's addresses: their LAN chatter is routine."""
+    ips = set()
+    for cmd in (["ip", "-4", "-o", "addr"], ["ip", "-4", "route", "show", "default"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            continue
+        ips.update(re.findall(r"(?:inet|via) (\d+\.\d+\.\d+\.\d+)", out))
+    return ips
+
+
+def likely_causes(r, routine=()):
+    """What stood out, each with its evidence. None of it is a proven cause.
+    `routine` holds addresses (this Pi, the router) not worth listing."""
     c = []
     t = r["t"]
+    # no request has worked since the bridge started: it began mid-freeze
+    reqs = r.get("last_requests") or []
+    if r.get("never_answered") and reqs and not any(x["ok"] for x in reqs):
+        return ["The receiver has not answered since the bridge restarted, so this "
+                "freeze probably began earlier: this report can't show what started it"]
     if marks["sound_change"] and t - marks["sound_change"] < 300:
         c.append(f"Sound change {t - marks['sound_change']:.0f} s before "
-                 "(reproduced trigger; the 30 s quiet window should prevent it)")
+                 "(froze after this in one test; later tests did not repeat it)")
     if marks["heavy_cmd"] and t - marks["heavy_cmd"] < 60:
         c.append(f"Power/input command {t - marks['heavy_cmd']:.0f} s before "
                  f"({marks['heavy_what']})")
     p = r.get("capture") or {}
     for ip, n in (p.get("arp_sweeps") or {}).items():
-        c.append(f"Device {ip} scanned the network ({n} ARP requests in the last "
-                 f"{WINDOW_S // 60} min): an app looking for devices may have probed the receiver")
+        if ip in routine:
+            continue
+        c.append(f"Seen, not proven to matter: {ip} sent {n} address lookups (ARP) in "
+                 f"the last {WINDOW_S // 60} min")
     flood = {ip: n for ip, n in (p.get("ssdp_per_min_by_source") or {}).items()
-             if n > 6 and ip != RX}
+             if n > 6 and ip != RX and ip not in routine}
     for ip, n in flood.items():
-        c.append(f"SSDP announcements from {ip}: {n}/min (normal is well under 1/min)")
+        c.append(f"Seen, not proven to matter: {ip} sent {n} device announcements "
+                 "(SSDP) per minute; a heavier test flood did not freeze the receiver")
     if r.get("pi_network_changes"):
         c.append("The Pi's network changed in the last 15 minutes")
     if r.get("playing"):
@@ -181,8 +202,7 @@ def likely_causes(r):
                  "the receiver's UPnP side was busy")
     up = r.get("since_receiver_came_back_s")
     if up and up > 3 * 3600 and not r.get("playing"):
-        c.append(f"Idle build-up: {up / 3600:.1f} h since the receiver last came back, "
-                 "nothing unusual just before (the slow idle freeze)")
+        c.append(f"Froze while idle, {up / 3600:.1f} h since the receiver last came back")
     hangs = [e for e in r.get("recent_events", []) if e.get("kind") == "rx-down"]
     if len(hangs) > 1:
         c.append(f"{len(hangs) - 1} short hang(s) in the hours before: the receiver was "
@@ -201,6 +221,8 @@ def report(error):
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(t))
         os.makedirs(DIR, exist_ok=True)
         came_back = sc.rx_stats.get("last_recovered") or sc.health.get("started")
+        never_answered = not sc.rx_stats.get("last_recovered") and not any(
+            x[1] == "ok" for x in sc.rx_stats["log"])
         ex = getattr(sc, "extras", None)
         r = {
             "t": int(t), "when": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)),
@@ -221,7 +243,8 @@ def report(error):
         n = cut_pcap(t, pcap)
         r["capture_file"] = pcap if n else None
         r["capture"] = summarize_pcap(pcap, t) if n else {"packets": 0}
-        r["likely_causes"] = likely_causes(r)
+        r["never_answered"] = never_answered
+        r["likely_causes"] = likely_causes(r, _own_and_router_ips())
         with open(os.path.join(DIR, stamp + ".json"), "w") as f:
             json.dump(r, f, indent=1)
         log.info("freeze report %s: %s", stamp, "; ".join(r["likely_causes"])[:300])

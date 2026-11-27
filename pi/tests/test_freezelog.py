@@ -63,13 +63,30 @@ class Causes(unittest.TestCase):
                                                             "192.168.1.7": 9.0}}}
         c = " | ".join(freezelog.likely_causes(r))
         self.assertIn("Sound change 40 s before", c)
-        self.assertIn("192.168.1.10 scanned the network", c)
-        self.assertIn("192.168.1.110: 26.0/min", c)
-        self.assertNotIn("192.168.1.7:", c)       # the receiver's own announcements
+        self.assertIn("192.168.1.10 sent", c)
+        self.assertIn("192.168.1.110 sent 26.0 device announcements", c)
+        self.assertNotIn("192.168.1.7 sent", c)   # the receiver's own announcements
 
     def test_idle_build_up(self):
         r = {"t": time.time(), "since_receiver_came_back_s": 6 * 3600, "playing": False}
-        self.assertIn("Idle build-up: 6.0 h", " ".join(freezelog.likely_causes(r)))
+        self.assertIn("Froze while idle, 6.0 h", " ".join(freezelog.likely_causes(r)))
+
+    def test_pi_and_router_are_not_listed(self):
+        r = {"t": time.time(), "capture": {
+            "arp_sweeps": {"192.168.1.110": 60, "192.168.1.1": 40},
+            "ssdp_per_min_by_source": {"192.168.1.1": 44.0}}}
+        self.assertEqual(freezelog.likely_causes(r, {"192.168.1.110", "192.168.1.1"}),
+                         ["Nothing unusual found: see the capture"])
+
+    def test_report_begun_by_a_restart_mid_freeze(self):
+        r = {"t": time.time(), "never_answered": True,
+             "last_requests": [{"ok": False}, {"ok": False}],
+             "capture": {"ssdp_per_min_by_source": {"192.168.1.90": 170.0}}}
+        c = freezelog.likely_causes(r)
+        self.assertEqual(len(c), 1)
+        self.assertIn("probably began earlier", c[0])
+        r["last_requests"].append({"ok": True})
+        self.assertIn("192.168.1.90", " ".join(freezelog.likely_causes(r)))
 
     def test_nothing_found(self):
         self.assertEqual(freezelog.likely_causes({"t": time.time()}),

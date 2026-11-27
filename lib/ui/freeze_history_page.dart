@@ -71,7 +71,7 @@ class _FreezeHistoryPageState extends State<FreezeHistoryPage> {
                       childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                       expandedCrossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('Likely causes',
+                        const Text('What stood out (not proven causes)',
                             style: TextStyle(fontWeight: FontWeight.w700)),
                         const SizedBox(height: 4),
                         for (final c in ((r['likely_causes'] as List?) ?? []))

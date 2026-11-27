@@ -3,29 +3,33 @@
 ## Unreleased (PR #4, branch `claude/setup-connectivity`)
 
 ### Receiver freezes
-- Fixed: the bridge left UPnP event subscriptions behind on every restart; the
-  receiver's network control froze within seconds. Events are now off by default
-  and the bridge unsubscribes on exit.
-- Fixed, reproduced: changing the receiver's sound processing over the network
-  (sound program, Straight, Enhancer, tone, night mode, Dialogue Lift, ...) and
-  then sending more requests froze it after a couple of changes. The bridge now
-  leaves the receiver alone for 30 s after any sound change, refuses a second
-  change inside that window, and sends a scene's sound settings together.
+- The bridge left UPnP event subscriptions behind on every restart. Events are
+  now off by default and the bridge unsubscribes on exit. This may explain some
+  freezes, but not all: long freezes happened before the subscription code.
+- Changing sound processing over the network was followed by a freeze in one
+  test. Later tests (24 spaced and 138 rapid changes) did not repeat it. As a
+  precaution the bridge leaves the receiver alone for 30 s after a sound change,
+  refuses a second change inside that window, and sends a scene's sound settings
+  together.
 - Gentler everywhere: 0.25 s minimum between requests, 3 s settle after power,
   input and scene commands, about a third of the traffic while music plays.
 - The Pi answers address lookups only for its own interface (ARP flux), and its
   Wi-Fi is off; it runs on Ethernet.
 - Freeze reports: each freeze is recorded with the last requests, recent
-  changes, response times, network floods and scans, and a 10-minute capture,
-  plus ranked likely causes. In the app: Receiver → Freeze history.
+  changes, response times, network activity and a 10-minute capture, plus what
+  stood out (observations, not proven causes). A report begun by a bridge restart
+  during a freeze says so. In the app: Receiver → Freeze history.
 - Alerts within about a minute of a freeze (ntfy), and a red notice on Home.
 - Freeze rescue (`pi/rescue.py`): 90 s into a freeze the bridge tries the
   receiver's other control port (50000): a query, a network-player restart, then
   a standby cycle if nobody is using it. Each step is recorded. Not yet seen
   against a real freeze.
-- Still open: a slow freeze after 5-6 idle hours. Under test: the Pi cast (DLNA)
-  service, which announced itself every ~14 s; a rebuilt version announces
-  every 30 min (`pi/build-gmrender.sh`).
+- Still open: the root cause is unknown. Idle freezes continued with the Pi cast
+  (DLNA) service off and with status checks cut to one per 5 minutes.
+- `pi/rxbaseline.sh`: a 48 h test with the whole bridge kept away from the
+  receiver; it can arm itself to start after the next recovery.
+- `pi/rxkeep.sh`: keeps the rolling capture from overwriting itself during a
+  test.
 
 ### New on the receiver
 - AirPlay 2, Bluetooth, Pi cast (DLNA), internet radio on the Pi; last source wins.
